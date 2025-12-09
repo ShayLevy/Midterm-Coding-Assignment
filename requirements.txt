@@ -13,6 +13,7 @@ llama-index-vector-stores-chroma>=0.1.6
 # Note: "LangChain 1.0" refers to the 0.3+ stable API series
 langchain>=0.3.0
 langchain-openai>=0.2.0
+langchain-anthropic>=0.2.0
 langchain-core>=0.3.0
 langchain-community>=0.3.0
 

@@ -46,9 +46,10 @@
 
 ### 5. **Evaluation System** ✅
 
-- ✅ LLM-as-a-judge implementation
+- ✅ LLM-as-a-judge implementation with **model separation**
+- ✅ OpenAI GPT-4 for generation, Anthropic Claude for evaluation (unbiased)
 - ✅ 3 metrics: Correctness, Relevancy, Recall
-- ✅ 8 diverse test queries
+- ✅ 10 diverse test queries
 - ✅ Automated evaluation runner
 - ✅ JSON result export
 
@@ -385,7 +386,7 @@ This is a **complete, production-ready implementation** of a multi-agent GenAI s
 - ✅ 30 project files
 - ✅ 8,000+ word documentation
 - ✅ 27,000+ word dataset
-- ✅ 8 comprehensive test queries
+- ✅ 10 comprehensive test queries
 - ✅ Full evaluation pipeline
 
 **You're ready to submit! 🚀**

@@ -1,12 +1,20 @@
 """
 Evaluation Runner
 Runs the complete test suite and evaluates system performance using LLM-as-a-judge
+
+Uses Anthropic Claude as judge (requires ANTHROPIC_API_KEY in .env)
+Uses OpenAI GPT-4 for generation (requires OPENAI_API_KEY in .env)
 """
 
 import json
 from pathlib import Path
 from datetime import datetime
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+# Ensures both OPENAI_API_KEY and ANTHROPIC_API_KEY are available
+load_dotenv()
 
 from main import InsuranceClaimSystem
 from src.evaluation.judge import LLMJudge
@@ -31,13 +39,16 @@ class EvaluationRunner:
         Args:
             system: Initialized InsuranceClaimSystem
             output_dir: Directory to save results
+
+        Note: Uses Anthropic Claude as judge (separate from OpenAI GPT-4 used for generation)
         """
         self.system = system
-        self.judge = LLMJudge(judge_model="gpt-4", temperature=0)
+        # Use Claude as judge (default: claude-sonnet-4-20250514) - separate from GPT-4 used for generation
+        self.judge = LLMJudge(temperature=0)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
 
-        logger.info("EvaluationRunner initialized")
+        logger.info("EvaluationRunner initialized with Claude judge (separate from GPT-4 generation)")
 
     def run_full_evaluation(self) -> dict:
         """

@@ -177,6 +177,46 @@ class TestSuite:
                     "Dr. Rachel Kim",
                     "Marcus Rodriguez, PT"
                 ]
+            },
+
+            # Query 9: Needle query - BAC level (tests precise fact extraction)
+            {
+                "id": "Q9_NEEDLE_BAC",
+                "query": "What was Robert Harrison's Blood Alcohol Concentration (BAC)?",
+                "type": "needle",
+                "expected_agent": "needle",
+                "expected_index": "hierarchical",
+                "ground_truth": "Robert Harrison's Blood Alcohol Concentration (BAC) was 0.14%, which is significantly above the legal limit of 0.08%.",
+                "expected_chunks": [
+                    "Police Report section",
+                    "Incident Timeline section"
+                ],
+                "key_facts": [
+                    "0.14%",
+                    "BAC",
+                    "above legal limit"
+                ]
+            },
+
+            # Query 10: Summary query - witnesses (tests summary retrieval)
+            {
+                "id": "Q10_SUMMARY_WITNESSES",
+                "query": "Who were the witnesses and what did they observe?",
+                "type": "summary",
+                "expected_agent": "summarization",
+                "expected_index": "summary",
+                "ground_truth": "There were three witnesses: Marcus Thompson (rideshare driver) saw Harrison's Camry run a red light at high speed without braking. Elena Rodriguez (pedestrian) observed the Camry had a red light for 3-4 seconds before entering the intersection and noted Harrison appeared intoxicated after the crash. Patricia O'Brien (RN, commuter) confirmed the traffic signal timing and noted sunrise was at 6:58 AM with normal lighting conditions.",
+                "expected_chunks": [
+                    "Witness Statements section",
+                    "All witness testimonies"
+                ],
+                "key_facts": [
+                    "Marcus Thompson",
+                    "Elena Rodriguez",
+                    "Patricia O'Brien",
+                    "ran red light",
+                    "appeared intoxicated"
+                ]
             }
         ]
 

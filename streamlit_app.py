@@ -11,6 +11,11 @@ import shutil
 import time
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+# This ensures OPENAI_API_KEY and ANTHROPIC_API_KEY are available
+load_dotenv()
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1023,21 +1028,43 @@ else:
     # TAB 3: RAGAS Evaluation
     # ==========================================================================
     elif selected_tab == "📊 RAGAS Evaluation":
-        st.markdown('<div class="step-header"><h3 style="margin:0;">RAGAS Evaluation</h3></div>', unsafe_allow_html=True)
+        st.markdown('<div class="step-header"><h3 style="margin:0;">System Evaluation</h3></div>', unsafe_allow_html=True)
 
-        st.info("""
-        **RAGAS (Retrieval Augmented Generation Assessment)** evaluates RAG pipeline quality using metrics:
-        - **Faithfulness**: Is the answer grounded in the retrieved context?
-        - **Answer Relevancy**: Is the answer relevant to the question?
-        - **Context Precision**: Are the retrieved chunks relevant?
-        - **Context Recall**: Does the context contain the information needed?
-        """)
+        # Evaluation method selector
+        eval_method = st.radio(
+            "Select Evaluation Method:",
+            ["RAGAS (OpenAI GPT-4o-mini)", "LLM-as-a-Judge (Anthropic Claude)"],
+            horizontal=True,
+            help="RAGAS uses OpenAI for compatibility. LLM-as-a-Judge uses Claude for truly independent evaluation."
+        )
 
-        # Initialize RAGAS session state
+        if eval_method == "RAGAS (OpenAI GPT-4o-mini)":
+            st.info("""
+            **RAGAS (Retrieval Augmented Generation Assessment)** evaluates RAG pipeline quality using metrics:
+            - **Faithfulness**: Is the answer grounded in the retrieved context?
+            - **Answer Relevancy**: Is the answer relevant to the question?
+            - **Context Precision**: Are the retrieved chunks relevant?
+            - **Context Recall**: Does the context contain the information needed?
+
+            *Note: Uses GPT-4o-mini (different from GPT-4 used for generation) due to RAGAS compatibility requirements.*
+            """)
+        else:
+            st.info("""
+            **LLM-as-a-Judge** uses Anthropic Claude (completely different provider) for truly independent evaluation:
+            - **Correctness**: Does the answer match the ground truth?
+            - **Relevancy**: Is the retrieved context relevant to the question?
+            - **Recall**: Were all necessary chunks retrieved?
+
+            *Uses Claude Sonnet - completely independent from OpenAI GPT-4 used for generation.*
+            """)
+
+        # Initialize session state
         if 'ragas_test_cases' not in st.session_state:
             st.session_state.ragas_test_cases = []
         if 'ragas_results' not in st.session_state:
             st.session_state.ragas_results = None
+        if 'judge_results' not in st.session_state:
+            st.session_state.judge_results = None
 
         # Test case management
         st.subheader("Test Cases")
@@ -1063,24 +1090,29 @@ else:
                 else:
                     st.warning("Please enter a question")
 
-        # Predefined test cases
-        needle_cases = [
-            {"question": "What was Robert Harrison's Blood Alcohol Concentration (BAC)?", "ground_truth": "0.14%", "category": "Needle"},
-            {"question": "What was the collision deductible amount?", "ground_truth": "$750", "category": "Needle"},
-            {"question": "What was the exact time the incident occurred?", "ground_truth": "7:42:15 AM on January 12, 2024", "category": "Needle"},
-            {"question": "What was the final total repair cost for the vehicle?", "ground_truth": "$17,111.83", "category": "Needle"},
-            {"question": "What was the policyholder's vehicle mileage at the time of the incident?", "ground_truth": "23,847 miles", "category": "Needle"},
+        # Predefined test cases - aligned with src/evaluation/test_queries.py (10 queries)
+        # These are the same queries used by run_evaluation.py for LLM-as-a-Judge evaluation
+        predefined_cases = [
+            # Summary queries (test Summary Index)
+            {"question": "What is this insurance claim about? Provide a summary.", "ground_truth": "This is an auto insurance claim (CLM-2024-001) for a multi-vehicle collision that occurred on January 12, 2024, at 7:42 AM at the intersection of Wilshire Blvd and Vermont Ave in Los Angeles. Sarah Mitchell's 2021 Honda Accord was struck by Robert Harrison's vehicle which ran a red light while Harrison was driving under the influence (BAC 0.14). Mitchell sustained whiplash injuries, the vehicle required $17,111.83 in repairs, and the total claim amount was $23,370.80.", "category": "Summary"},
+            {"question": "Provide a timeline of key events from the incident through vehicle return.", "ground_truth": "January 12, 2024 (7:42 AM): Incident occurred. January 15, 2024: Claim filed. January 26, 2024: Liability accepted by at-fault party. January 29, 2024: Repairs authorized and commenced. February 15, 2024: Repairs completed. February 16, 2024: Vehicle returned to policyholder.", "category": "Summary"},
+            # Needle queries (test Hierarchical Index with small chunks)
+            {"question": "What was the exact collision deductible amount?", "ground_truth": "The collision deductible was exactly $750.", "category": "Needle"},
+            {"question": "At what exact time did the accident occur?", "ground_truth": "The accident occurred at exactly 7:42 AM (more precisely 7:42:15 AM based on the incident timeline).", "category": "Needle"},
+            {"question": "Who was the claims adjuster assigned to this case?", "ground_truth": "Kevin Park was the claims adjuster assigned to this case.", "category": "Needle"},
+            # MCP/Computation query
+            {"question": "How many days passed between the incident date and when the claim was filed?", "ground_truth": "3 days passed between the incident (January 12, 2024) and when the claim was filed (January 15, 2024).", "category": "MCP"},
+            # Sparse/Needle-in-haystack query (tests deep search)
+            {"question": "What specific observation did Patricia O'Brien make about lighting conditions?", "ground_truth": "Patricia O'Brien noted that the street lights were on a normal cycle and that sunrise was at 6:58 AM, so at 7:42 AM there would have been daylight. She confirmed the Camry definitely would have had a red light.", "category": "Sparse"},
+            # Hybrid query (summary + precise facts)
+            {"question": "Summarize the medical treatment and provide the exact number of physical therapy sessions.", "ground_truth": "Sarah Mitchell was treated at Cedars-Sinai Emergency Department for cervical strain (whiplash) and post-traumatic headache. She had a follow-up with orthopedist Dr. Rachel Kim who prescribed physical therapy. She completed exactly 8 physical therapy sessions at Pacific Coast Physical Therapy with Marcus Rodriguez, PT, DPT, from February 2-27, 2024.", "category": "Hybrid"},
+            # Additional Needle query - BAC level
+            {"question": "What was Robert Harrison's Blood Alcohol Concentration (BAC)?", "ground_truth": "Robert Harrison's Blood Alcohol Concentration (BAC) was 0.14%, which is significantly above the legal limit of 0.08%.", "category": "Needle"},
+            # Additional Summary query - witnesses
+            {"question": "Who were the witnesses and what did they observe?", "ground_truth": "There were three witnesses: Marcus Thompson (rideshare driver) saw Harrison's Camry run a red light at high speed without braking. Elena Rodriguez (pedestrian) observed the Camry had a red light for 3-4 seconds before entering the intersection and noted Harrison appeared intoxicated after the crash. Patricia O'Brien (RN, commuter) confirmed the traffic signal timing and noted sunrise was at 6:58 AM with normal lighting conditions.", "category": "Summary"},
         ]
 
-        general_cases = [
-            {"question": "What is this insurance claim about?", "ground_truth": "Multi-vehicle collision claim involving Sarah Mitchell's 2021 Honda Accord being struck by a DUI driver (Robert Harrison) who ran a red light at Wilshire Blvd and Vermont Ave intersection", "category": "General"},
-            {"question": "What injuries did the policyholder sustain and what treatment was provided?", "ground_truth": "Cervical strain (whiplash), post-traumatic headache, and minor contusions. Treatment included emergency department visit, soft cervical collar, pain medication, orthopedic consultation, and 8 physical therapy sessions", "category": "General"},
-            {"question": "Who were the witnesses and what did they observe?", "ground_truth": "Marcus Thompson, Elena Rodriguez, and Patricia O'Brien (RN) - all confirmed Harrison ran a clearly red light while visibly intoxicated, traveling at high speed without braking", "category": "General"},
-            {"question": "What was the outcome of the liability investigation?", "ground_truth": "Nationwide Insurance (carrier for at-fault driver Robert Harrison) accepted 100% liability on January 26, 2024, agreeing to cover all property damage and medical expenses", "category": "General"},
-            {"question": "Summarize the timeline of events on the day of the accident", "ground_truth": "7:38 AM departure, 7:42:15 AM collision occurred, 7:43 AM Harrison exits vehicle showing signs of intoxication, 7:44 AM 911 called, 7:51 AM police arrive, 8:02 AM breathalyzer shows 0.14% BAC, 8:15 AM Mitchell transported to hospital, 10:17 AM discharged with cervical strain diagnosis", "category": "General"},
-        ]
-
-        all_predefined_cases = needle_cases + general_cases
+        all_predefined_cases = predefined_cases
 
         if st.button("Load Questions", type="primary"):
             st.session_state.ragas_test_cases = all_predefined_cases.copy()
@@ -1105,28 +1137,25 @@ else:
 
             df = pd.DataFrame(table_data)
 
-            # Custom CSS for auto-sizing first columns
-            st.markdown("""
-            <style>
-                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(1),
-                [data-testid="stDataEditor"] td:nth-child(1) { width: auto !important; min-width: 40px !important; max-width: 60px !important; }
-                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(2),
-                [data-testid="stDataEditor"] td:nth-child(2) { width: auto !important; min-width: 60px !important; max-width: 80px !important; }
-                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(3),
-                [data-testid="stDataEditor"] td:nth-child(3) { width: auto !important; min-width: 200px !important; }
-            </style>
-            """, unsafe_allow_html=True)
-
-            # Use data_editor for editable checkboxes - it maintains its own state via key
+            # Use data_editor for editable checkboxes
             edited_df = st.data_editor(
                 df,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    'Select': st.column_config.CheckboxColumn('', default=True),
-                    'Category': st.column_config.TextColumn('Category'),
-                    'Question': st.column_config.TextColumn('Question'),
-                    'Ground Truth': st.column_config.TextColumn('Ground Truth'),
+                    'Select': st.column_config.CheckboxColumn(
+                        'Select',
+                        default=True,
+                    ),
+                    'Category': st.column_config.TextColumn(
+                        'Category',
+                    ),
+                    'Question': st.column_config.TextColumn(
+                        'Question',
+                    ),
+                    'Ground Truth': st.column_config.TextColumn(
+                        'Ground Truth',
+                    ),
                 },
                 disabled=['Category', 'Question', 'Ground Truth'],
                 key="ragas_table_editor"
@@ -1141,41 +1170,23 @@ else:
                 if st.button("Clear All Test Cases", type="secondary"):
                     st.session_state.ragas_test_cases = []
                     st.session_state.ragas_results = None
+                    st.session_state.judge_results = None
                     # Clear the data_editor state
                     if 'ragas_table_editor' in st.session_state:
                         del st.session_state['ragas_table_editor']
 
             with col2:
-                run_eval = st.button("Run RAGAS Evaluation", type="primary", use_container_width=True)
+                # Dynamic button label based on selected evaluation method
+                button_label = "Run RAGAS Evaluation" if eval_method == "RAGAS (OpenAI GPT-4o-mini)" else "Run LLM-as-a-Judge"
+                run_eval = st.button(button_label, type="primary", use_container_width=True)
 
             if run_eval and selected_count > 0:
-                with st.spinner("Running RAGAS evaluation... This may take a few minutes."):
+                # Determine which evaluation method to use
+                is_ragas = eval_method == "RAGAS (OpenAI GPT-4o-mini)"
+                spinner_text = "Running RAGAS evaluation..." if is_ragas else "Running LLM-as-a-Judge evaluation (Claude)..."
+
+                with st.spinner(spinner_text):
                     try:
-                        # Import RAGAS components
-                        from ragas import evaluate
-                        from ragas.metrics import (
-                            faithfulness,
-                            answer_relevancy,
-                            context_precision,
-                            context_recall
-                        )
-                        from ragas.llms import LangchainLLMWrapper
-                        from ragas.embeddings import LangchainEmbeddingsWrapper
-                        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-                        from datasets import Dataset
-
-                        # Configure RAGAS with OpenAI models
-                        ragas_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini", temperature=0))
-                        ragas_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="text-embedding-3-small"))
-
-                        # Collect data for evaluation
-                        questions = []
-                        answers = []
-                        contexts = []
-                        ground_truths = []
-
-                        progress = st.progress(0, text="Processing test cases...")
-
                         # Filter to only selected test cases using edited_df
                         selected_cases = [
                             (i, tc) for i, tc in enumerate(st.session_state.ragas_test_cases)
@@ -1187,80 +1198,140 @@ else:
                             st.warning("No test cases selected. Please select at least one question.")
                             st.stop()
 
-                        for idx, (orig_idx, test_case) in enumerate(selected_cases):
-                            progress.progress(
-                                (idx + 1) / total_cases,
-                                text=f"Processing Q{orig_idx+1} ({idx+1}/{total_cases}): {test_case['question'][:40]}..."
+                        if is_ragas:
+                            # ============== RAGAS EVALUATION ==============
+                            from ragas import evaluate
+                            from ragas.metrics import (
+                                faithfulness,
+                                answer_relevancy,
+                                context_precision,
+                                context_recall
                             )
+                            from ragas.llms import LangchainLLMWrapper
+                            from ragas.embeddings import LangchainEmbeddingsWrapper
+                            from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+                            from datasets import Dataset
 
-                            # Run query through the system
-                            result = st.session_state.system.query(test_case['question'])
+                            ragas_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini", temperature=0))
+                            ragas_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="text-embedding-3-small"))
 
-                            questions.append(test_case['question'])
-                            answers.append(result.get('output', ''))
+                            questions, answers, contexts, ground_truths = [], [], [], []
+                            progress = st.progress(0, text="Processing test cases...")
 
-                            # Get contexts from the retrieval
-                            # We need to retrieve contexts separately for RAGAS
-                            retrieved_contexts = []
-                            if hasattr(st.session_state.system, 'hierarchical_retriever'):
-                                nodes = st.session_state.system.hierarchical_retriever.retrieve(
-                                    test_case['question'], k=3, auto_merge=True
-                                )
-                                retrieved_contexts = [node.node.text for node in nodes]
+                            for idx, (orig_idx, test_case) in enumerate(selected_cases):
+                                progress.progress((idx + 1) / total_cases,
+                                    text=f"Processing Q{orig_idx+1} ({idx+1}/{total_cases}): {test_case['question'][:40]}...")
 
-                            contexts.append(retrieved_contexts if retrieved_contexts else [result.get('output', '')])
-                            ground_truths.append(test_case['ground_truth'] if test_case['ground_truth'] else '')
+                                result = st.session_state.system.query(test_case['question'])
+                                questions.append(test_case['question'])
+                                answers.append(result.get('output', ''))
 
-                        progress.progress(1.0, text="Running RAGAS metrics...")
+                                retrieved_contexts = []
+                                if hasattr(st.session_state.system, 'hierarchical_retriever'):
+                                    nodes = st.session_state.system.hierarchical_retriever.retrieve(
+                                        test_case['question'], k=3, auto_merge=True)
+                                    retrieved_contexts = [node.node.text for node in nodes]
 
-                        # Create dataset for RAGAS
-                        eval_data = {
-                            'question': questions,
-                            'answer': answers,
-                            'contexts': contexts,
-                            'ground_truth': ground_truths
-                        }
+                                contexts.append(retrieved_contexts if retrieved_contexts else [result.get('output', '')])
+                                ground_truths.append(test_case['ground_truth'] if test_case['ground_truth'] else '')
 
-                        dataset = Dataset.from_dict(eval_data)
+                            progress.progress(1.0, text="Running RAGAS metrics...")
 
-                        # Select metrics based on whether ground truth is available
-                        has_ground_truth = any(gt for gt in ground_truths if gt)
-                        if has_ground_truth:
-                            metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+                            eval_data = {'question': questions, 'answer': answers, 'contexts': contexts, 'ground_truth': ground_truths}
+                            dataset = Dataset.from_dict(eval_data)
+
+                            has_ground_truth = any(gt for gt in ground_truths if gt)
+                            metrics = [faithfulness, answer_relevancy, context_precision, context_recall] if has_ground_truth else [faithfulness, answer_relevancy, context_precision]
+
+                            eval_result = evaluate(dataset, metrics=metrics, llm=ragas_llm, embeddings=ragas_embeddings)
+
+                            scores_dict = {}
+                            for metric_key in ['faithfulness', 'answer_relevancy', 'context_precision', 'context_recall']:
+                                try:
+                                    scores_dict[metric_key] = eval_result[metric_key]
+                                except (KeyError, TypeError):
+                                    scores_dict[metric_key] = None
+
+                            st.session_state.ragas_results = {
+                                'scores': scores_dict, 'details': eval_data,
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'method': 'RAGAS'
+                            }
+                            st.session_state.judge_results = None
+
                         else:
-                            metrics = [faithfulness, answer_relevancy, context_precision]
+                            # ============== LLM-AS-A-JUDGE EVALUATION (Claude) ==============
+                            from src.evaluation.judge import LLMJudge
 
-                        # Run evaluation with configured LLM and embeddings
-                        eval_result = evaluate(
-                            dataset,
-                            metrics=metrics,
-                            llm=ragas_llm,
-                            embeddings=ragas_embeddings
-                        )
+                            judge = LLMJudge(temperature=0)  # Uses Claude by default
+                            progress = st.progress(0, text="Evaluating with Claude...")
 
-                        # Convert EvaluationResult to dict for easier access
-                        metric_keys = ['faithfulness', 'answer_relevancy', 'context_precision', 'context_recall']
-                        scores_dict = {}
-                        for metric_key in metric_keys:
-                            try:
-                                scores_dict[metric_key] = eval_result[metric_key]
-                            except (KeyError, TypeError):
-                                scores_dict[metric_key] = None
+                            query_results = []
+                            for idx, (orig_idx, test_case) in enumerate(selected_cases):
+                                progress.progress((idx + 1) / total_cases,
+                                    text=f"Evaluating Q{orig_idx+1} ({idx+1}/{total_cases}): {test_case['question'][:40]}...")
 
-                        st.session_state.ragas_results = {
-                            'scores': scores_dict,
-                            'details': eval_data,
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        }
+                                # Run query through the system
+                                result = st.session_state.system.query(test_case['question'])
+                                answer = result.get('output', '')
+
+                                # Get retrieved context
+                                retrieved_context = ""
+                                retrieved_chunks = []
+                                if hasattr(st.session_state.system, 'hierarchical_retriever'):
+                                    nodes = st.session_state.system.hierarchical_retriever.retrieve(
+                                        test_case['question'], k=3, auto_merge=True)
+                                    retrieved_chunks = [node.node.text for node in nodes]
+                                    retrieved_context = "\n\n".join(retrieved_chunks)
+
+                                # Run evaluation
+                                ground_truth = test_case['ground_truth'] if test_case['ground_truth'] else ''
+                                eval_result = judge.evaluate_full(
+                                    query=test_case['question'],
+                                    answer=answer,
+                                    ground_truth=ground_truth,
+                                    retrieved_context=retrieved_context if retrieved_context else answer,
+                                    expected_chunks=[],
+                                    retrieved_chunks=retrieved_chunks
+                                )
+
+                                query_results.append({
+                                    'question': test_case['question'],
+                                    'answer': answer,
+                                    'ground_truth': ground_truth,
+                                    'correctness': eval_result['correctness']['score'],
+                                    'relevancy': eval_result['relevancy']['score'],
+                                    'recall': eval_result.get('recall', {}).get('score', 'N/A'),
+                                    'average': eval_result['average_score'],
+                                    'details': eval_result
+                                })
+
+                            progress.progress(1.0, text="Complete!")
+
+                            # Calculate aggregate scores
+                            correctness_scores = [r['correctness'] for r in query_results if isinstance(r['correctness'], (int, float))]
+                            relevancy_scores = [r['relevancy'] for r in query_results if isinstance(r['relevancy'], (int, float))]
+                            avg_scores = [r['average'] for r in query_results if isinstance(r['average'], (int, float))]
+
+                            st.session_state.judge_results = {
+                                'scores': {
+                                    'correctness': sum(correctness_scores) / len(correctness_scores) if correctness_scores else 0,
+                                    'relevancy': sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else 0,
+                                    'average': sum(avg_scores) / len(avg_scores) if avg_scores else 0
+                                },
+                                'query_results': query_results,
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'method': 'LLM-as-a-Judge (Claude)'
+                            }
+                            st.session_state.ragas_results = None
 
                         st.success("Evaluation complete!")
                         st.rerun()
 
                     except ImportError as e:
                         st.error(f"""
-                        RAGAS not installed. Please install it:
+                        Required packages not installed. Please install:
                         ```
-                        pip install ragas datasets
+                        pip install ragas datasets langchain-anthropic
                         ```
                         Error: {e}
                         """)
@@ -1346,6 +1417,328 @@ else:
                     file_name=f"ragas_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
+
+            # RAGAS Improvement Recommendations
+            st.divider()
+            st.subheader("RAGAS Improvement Recommendations")
+
+            # Get scores (handle list scores by averaging)
+            def get_avg_score(score):
+                if score is None:
+                    return 0
+                if isinstance(score, list):
+                    return sum(score) / len(score) if score else 0
+                return score
+
+            faithfulness_score = get_avg_score(results.get('faithfulness'))
+            relevancy_score = get_avg_score(results.get('answer_relevancy'))
+            precision_score = get_avg_score(results.get('context_precision'))
+            recall_score = get_avg_score(results.get('context_recall'))
+
+            # Faithfulness recommendations
+            with st.expander("Faithfulness Recommendations", expanded=True):
+                if faithfulness_score >= 0.8:
+                    st.success("**Score: Good (80%+)** - Answers are well-grounded in retrieved context.")
+                    st.markdown("""
+                    **To maintain high faithfulness:**
+                    - Continue instructing the LLM to only use retrieved context
+                    - Keep prompt instructions clear about not hallucinating
+                    """)
+                elif faithfulness_score >= 0.5:
+                    st.warning("**Score: Moderate (50-80%)** - Some answers contain information not in context.")
+                    st.markdown("""
+                    **To improve faithfulness:**
+                    - **Strengthen prompts**: Add explicit instructions like "Only use information from the provided context"
+                    - **Lower temperature**: Use temperature=0 for more deterministic responses
+                    - **Add citations**: Require the LLM to cite which chunk each fact comes from
+                    - **Increase context**: Retrieve more chunks to provide more grounding information
+                    """)
+                else:
+                    st.error("**Score: Low (<50%)** - Answers frequently contain hallucinated information.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review prompts urgently**: LLM is generating content not grounded in context
+                    - **Use structured output**: Force specific answer formats
+                    - **Implement fact-checking**: Add a verification step before returning answers
+                    - **Consider different model**: Some models are more prone to hallucination
+                    - **Reduce context noise**: Too much irrelevant context may confuse the model
+                    """)
+
+            # Answer Relevancy recommendations
+            with st.expander("Answer Relevancy Recommendations", expanded=True):
+                if relevancy_score >= 0.8:
+                    st.success("**Score: Good (80%+)** - Answers are highly relevant to questions.")
+                    st.markdown("""
+                    **To maintain high relevancy:**
+                    - Current question-answering approach is working well
+                    - Continue monitoring for edge cases
+                    """)
+                elif relevancy_score >= 0.5:
+                    st.warning("**Score: Moderate (50-80%)** - Some answers don't directly address the question.")
+                    st.markdown("""
+                    **To improve answer relevancy:**
+                    - **Refine prompts**: Be more explicit about answering the specific question asked
+                    - **Add question rephrasing**: Include the question in the response template
+                    - **Use chain-of-thought**: Let the model reason through what's being asked
+                    - **Filter verbose responses**: Post-process to extract only relevant parts
+                    """)
+                else:
+                    st.error("**Score: Low (<50%)** - Answers frequently miss the point of questions.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review query understanding**: Model may be misinterpreting questions
+                    - **Simplify questions**: Test with simpler, more direct questions first
+                    - **Add query classification**: Route different question types appropriately
+                    - **Check context relevance first**: Poor context leads to poor answers
+                    """)
+
+            # Context Precision recommendations
+            with st.expander("Context Precision Recommendations", expanded=True):
+                if precision_score >= 0.8:
+                    st.success("**Score: Good (80%+)** - Retrieved chunks are highly relevant.")
+                    st.markdown("""
+                    **To maintain high precision:**
+                    - Current retrieval strategy is effective
+                    - Consider reducing k if retrieving unnecessary chunks
+                    """)
+                elif precision_score >= 0.5:
+                    st.warning("**Score: Moderate (50-80%)** - Some retrieved chunks are not useful.")
+                    st.markdown("""
+                    **To improve context precision:**
+                    - **Reduce retrieval k**: Retrieve fewer, more relevant chunks
+                    - **Add reranking**: Use a cross-encoder to rerank retrieved chunks
+                    - **Improve embeddings**: Use domain-specific embeddings if available
+                    - **Filter by metadata**: Use section/type filters to narrow results
+                    - **Use MMR**: Maximum Marginal Relevance reduces redundant chunks
+                    """)
+                else:
+                    st.error("**Score: Low (<50%)** - Most retrieved chunks are irrelevant.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review embedding model**: Current embeddings may not capture query intent
+                    - **Rebuild indexes**: Try different chunk sizes and overlap settings
+                    - **Implement hybrid search**: Combine semantic and keyword search
+                    - **Add query preprocessing**: Clean and expand queries before retrieval
+                    - **Check index health**: Verify ChromaDB indexes are built correctly
+                    """)
+
+            # Context Recall recommendations
+            with st.expander("Context Recall Recommendations", expanded=True):
+                if recall_score >= 0.8:
+                    st.success("**Score: Good (80%+)** - All necessary information is being retrieved.")
+                    st.markdown("""
+                    **To maintain high recall:**
+                    - Current retrieval coverage is good
+                    - Monitor for queries that need information from multiple sections
+                    """)
+                elif recall_score >= 0.5:
+                    st.warning("**Score: Moderate (50-80%)** - Some needed information is not being retrieved.")
+                    st.markdown("""
+                    **To improve context recall:**
+                    - **Increase retrieval k**: Retrieve more chunks to improve coverage
+                    - **Use query expansion**: Add synonyms and related terms
+                    - **Multi-index search**: Search both Summary and Hierarchical indexes
+                    - **Reduce chunk size**: Smaller chunks may have better coverage
+                    - **Add fallback search**: If first search fails, try broader search
+                    """)
+                else:
+                    st.error("**Score: Low (<50%)** - Critical information is frequently missed.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review indexing coverage**: Ensure all document sections are indexed
+                    - **Check for parsing issues**: Some content may not be extracted properly
+                    - **Increase chunk overlap**: Higher overlap prevents boundary information loss
+                    - **Use multiple retrieval strategies**: Combine different approaches
+                    - **Add recursive retrieval**: Follow references to related chunks
+                    """)
+
+        # Display LLM-as-a-Judge results
+        if st.session_state.judge_results:
+            st.divider()
+            st.subheader("LLM-as-a-Judge Results (Claude)")
+            st.caption(f"Evaluated at: {st.session_state.judge_results['timestamp']}")
+            st.success("Using Anthropic Claude - completely independent from OpenAI GPT-4 used for generation")
+
+            results = st.session_state.judge_results['scores']
+
+            # Display overall scores
+            st.markdown("### Overall Scores (1-5 scale)")
+            score_cols = st.columns(3)
+
+            judge_metrics = [
+                ('correctness', 'Answer matches ground truth'),
+                ('relevancy', 'Context relevant to question'),
+                ('average', 'Overall average score')
+            ]
+
+            for i, (metric, desc) in enumerate(judge_metrics):
+                with score_cols[i]:
+                    score = results.get(metric, 0)
+                    if isinstance(score, (int, float)):
+                        # Color code based on score (1-5 scale)
+                        if score >= 4:
+                            color = "🟢"
+                        elif score >= 3:
+                            color = "🟡"
+                        else:
+                            color = "🔴"
+                        st.metric(
+                            label=f"{color} {metric.title()}",
+                            value=f"{score:.2f}/5",
+                            help=desc
+                        )
+                    else:
+                        st.metric(label=metric.title(), value="N/A")
+
+            # Show detailed results by question
+            with st.expander("Detailed Results by Question", expanded=True):
+                for i, qr in enumerate(st.session_state.judge_results['query_results']):
+                    st.markdown(f"**Q{i+1}: {qr['question']}**")
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        c_score = qr['correctness']
+                        c_color = "🟢" if c_score >= 4 else "🟡" if c_score >= 3 else "🔴"
+                        st.markdown(f"{c_color} **Correctness:** {c_score}/5")
+                    with col2:
+                        r_score = qr['relevancy']
+                        r_color = "🟢" if r_score >= 4 else "🟡" if r_score >= 3 else "🔴"
+                        st.markdown(f"{r_color} **Relevancy:** {r_score}/5")
+                    with col3:
+                        avg = qr['average']
+                        a_color = "🟢" if avg >= 4 else "🟡" if avg >= 3 else "🔴"
+                        st.markdown(f"{a_color} **Average:** {avg:.2f}/5")
+
+                    answer_preview = qr['answer'][:200] + "..." if len(qr['answer']) > 200 else qr['answer']
+                    st.markdown(f"**Answer:** {answer_preview}")
+                    st.divider()
+
+            # Export option
+            if st.button("Export LLM-as-a-Judge Results as CSV"):
+                import pandas as pd
+                export_data = {
+                    'Question': [qr['question'] for qr in st.session_state.judge_results['query_results']],
+                    'Answer': [qr['answer'] for qr in st.session_state.judge_results['query_results']],
+                    'Ground Truth': [qr['ground_truth'] for qr in st.session_state.judge_results['query_results']],
+                    'Correctness': [qr['correctness'] for qr in st.session_state.judge_results['query_results']],
+                    'Relevancy': [qr['relevancy'] for qr in st.session_state.judge_results['query_results']],
+                    'Average': [qr['average'] for qr in st.session_state.judge_results['query_results']],
+                }
+
+                df = pd.DataFrame(export_data)
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name=f"llm_judge_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+
+            # Improvement Recommendations based on scores
+            st.divider()
+            st.subheader("Improvement Recommendations")
+
+            correctness_avg = results.get('correctness', 0)
+            relevancy_avg = results.get('relevancy', 0)
+            overall_avg = results.get('average', 0)
+
+            # Correctness recommendations
+            with st.expander("Correctness Score Recommendations", expanded=True):
+                if correctness_avg >= 4:
+                    st.success("**Score: Good (4+/5)** - Your system is generating accurate answers.")
+                    st.markdown("""
+                    **To maintain high correctness:**
+                    - Continue using specific, well-structured prompts
+                    - Keep ground truth data up to date
+                    - Monitor for any drift in answer quality over time
+                    """)
+                elif correctness_avg >= 3:
+                    st.warning("**Score: Moderate (3-4/5)** - Answers are partially correct but missing some details.")
+                    st.markdown("""
+                    **To improve correctness:**
+                    - **Increase chunk overlap**: Try 25-30% overlap to capture more context at boundaries
+                    - **Add more small chunks**: Reduce small chunk size (e.g., 64-96 tokens) for better precision
+                    - **Improve prompts**: Make the LLM prompt more specific about extracting exact facts
+                    - **Check retrieval**: Ensure the right chunks are being retrieved (see Relevancy)
+                    - **Review ground truth**: Ensure your ground truth answers are accurate and complete
+                    """)
+                else:
+                    st.error("**Score: Low (<3/5)** - Answers are frequently incorrect or incomplete.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review chunking strategy**: Current chunks may be too large, splitting important information
+                    - **Reduce chunk sizes**: Try smaller chunks (128 tokens or less) for needle queries
+                    - **Check document parsing**: Ensure PDF text extraction is working correctly
+                    - **Increase retrieval k**: Retrieve more chunks (k=5-10) to capture more relevant information
+                    - **Add metadata filtering**: Use section-based filtering to narrow retrieval scope
+                    - **Verify embeddings**: Ensure embeddings capture semantic meaning properly
+                    - **Review LLM temperature**: Use temperature=0 for more deterministic, factual responses
+                    """)
+
+            # Relevancy recommendations
+            with st.expander("Relevancy Score Recommendations", expanded=True):
+                if relevancy_avg >= 4:
+                    st.success("**Score: Good (4+/5)** - Retrieved context is highly relevant to queries.")
+                    st.markdown("""
+                    **To maintain high relevancy:**
+                    - Current retrieval strategy is working well
+                    - Continue using hierarchical indexing for query routing
+                    - Monitor for edge cases where retrieval might fail
+                    """)
+                elif relevancy_avg >= 3:
+                    st.warning("**Score: Moderate (3-4/5)** - Some retrieved context is not directly relevant.")
+                    st.markdown("""
+                    **To improve relevancy:**
+                    - **Tune retrieval k**: Reduce k if retrieving too much irrelevant content
+                    - **Use metadata filters**: Filter by section, date, or document type
+                    - **Improve query routing**: Ensure summary vs needle queries go to appropriate indexes
+                    - **Add reranking**: Implement a reranker to filter out low-relevance chunks
+                    - **Review chunk boundaries**: Ensure chunks contain coherent, complete information
+                    """)
+                else:
+                    st.error("**Score: Low (<3/5)** - Retrieved context is often irrelevant to the query.")
+                    st.markdown("""
+                    **Critical improvements needed:**
+                    - **Review embedding model**: Current embeddings may not capture domain-specific semantics
+                    - **Fine-tune embeddings**: Consider domain-specific embedding fine-tuning
+                    - **Implement hybrid search**: Combine vector search with keyword (BM25) search
+                    - **Add query expansion**: Expand queries with synonyms or related terms
+                    - **Review index structure**: Ensure Summary and Hierarchical indexes are built correctly
+                    - **Check for data quality issues**: Verify document content is clean and well-formatted
+                    - **Implement MMR**: Use Maximum Marginal Relevance to diversify results
+                    """)
+
+            # Overall recommendations
+            with st.expander("Overall System Recommendations", expanded=True):
+                if overall_avg >= 4:
+                    st.success("**Overall: Excellent (4+/5)** - System is performing well!")
+                    st.markdown("""
+                    **Next steps:**
+                    - Add more diverse test cases to ensure robustness
+                    - Consider A/B testing different configurations
+                    - Monitor production performance over time
+                    - Document successful patterns for future reference
+                    """)
+                elif overall_avg >= 3:
+                    st.warning("**Overall: Acceptable (3-4/5)** - System works but has room for improvement.")
+                    st.markdown("""
+                    **Priority improvements:**
+                    1. Focus on the lowest-scoring metric first
+                    2. Review questions that scored below 3
+                    3. Consider adjusting chunk sizes based on query types
+                    4. Test with more diverse queries to identify weak spots
+                    """)
+                else:
+                    st.error("**Overall: Needs Work (<3/5)** - System requires significant improvements.")
+                    st.markdown("""
+                    **Recommended action plan:**
+                    1. **Rebuild indexes** with different chunk sizes (try 1024/256/64)
+                    2. **Review document quality** - ensure clean text extraction
+                    3. **Simplify queries** - test with basic queries first
+                    4. **Check API responses** - verify LLM is responding appropriately
+                    5. **Increase logging** - add detailed logs to identify failure points
+                    6. **Consider different models** - try GPT-4-turbo or Claude for generation
+                    """)
 
 # Footer
 st.divider()

@@ -105,8 +105,8 @@ This project implements a production-grade insurance claim retrieval system usin
 | Agent Orchestration | LangChain | Multi-agent coordination, tool calling |
 | Vector Store | ChromaDB | Persistent vector embeddings storage |
 | Embeddings | OpenAI (text-embedding-3-small) | Text vectorization |
-| LLM | OpenAI GPT-4 | Query processing, summarization |
-| Judge Model | OpenAI GPT-4 | Evaluation (separate instance) |
+| LLM (Generation) | OpenAI GPT-4 | Query processing, summarization |
+| LLM (Evaluation) | Anthropic Claude Sonnet | Independent judge model |
 | Data Validation | Pydantic | Schema validation |
 
 ---
@@ -485,7 +485,42 @@ manager_agent = ManagerAgent(tools=retrieval_tools + mcp_tools)
 
 ### LLM-as-a-Judge Framework
 
-We use a **separate GPT-4 instance** as an unbiased judge to evaluate system performance.
+We use **separate models** for generation and evaluation to ensure unbiased assessment:
+
+| Role | Model | Provider | Purpose |
+|------|-------|----------|---------|
+| **Answer Generation** | GPT-4 | OpenAI | RAG system query responses |
+| **CLI Evaluation** | Claude Sonnet | Anthropic | Independent judge (run_evaluation.py) |
+| **RAGAS Evaluation** | GPT-4o-mini | OpenAI | Streamlit RAGAS metrics |
+| **Embeddings** | text-embedding-3-small | OpenAI | Vector similarity for retrieval |
+
+### Two Evaluation Methods
+
+1. **LLM-as-a-Judge (CLI)** - `python run_evaluation.py`
+   - Uses **Anthropic Claude** as judge (completely different provider)
+   - Custom evaluation prompts for Correctness, Relevancy, Recall
+   - Truly independent evaluation
+
+2. **RAGAS Evaluation (Streamlit)**
+   - Uses **GPT-4o-mini** (different model than GPT-4 used for generation)
+   - RAGAS framework requires OpenAI-compatible models
+   - Metrics: Faithfulness, Answer Relevancy, Context Precision/Recall
+
+### Why Separate Models?
+
+Using the same model for both generation and evaluation creates **evaluation bias**:
+
+1. **Self-Preference Bias**: Models tend to rate their own outputs more favorably
+2. **Style Matching**: The judge may reward outputs that match its own generation patterns
+3. **Blind Spots**: Shared weaknesses won't be caught
+
+### API Keys Required
+
+```bash
+# .env file
+OPENAI_API_KEY=sk-...      # For RAG system (generation + embeddings + RAGAS)
+ANTHROPIC_API_KEY=...      # For CLI LLM-as-a-Judge evaluation
+```
 
 ### Evaluation Metrics
 
@@ -534,18 +569,20 @@ Output: {score, reasoning, matched_facts, missed_facts}
 
 ### Test Suite
 
-**8 Diverse Queries** covering all system capabilities:
+**10 Diverse Queries** covering all system capabilities (defined in `src/evaluation/test_queries.py`):
 
-| Query ID | Type | Description | Ground Truth Snippet |
-|----------|------|-------------|---------------------|
-| **Q1** | Summary | "What is this claim about?" | Multi-vehicle collision, DUI, $23,370 total |
-| **Q2** | Timeline | "Timeline from incident to vehicle return" | Jan 12 incident → Feb 16 return |
-| **Q3** | Needle | "Exact collision deductible?" | $750 |
-| **Q4** | Needle | "Exact accident time?" | 7:42:15 AM |
-| **Q5** | Entity | "Who was the claims adjuster?" | Kevin Park |
-| **Q6** | MCP | "Days between incident and filing?" | 3 days (MCP calculation) |
-| **Q7** | Sparse | "Patricia O'Brien's lighting observation?" | Sunrise 6:58 AM, normal cycle |
-| **Q8** | Hybrid | "Medical summary + exact PT sessions" | Whiplash, 8 PT sessions |
+| Query ID | Type | Query | Ground Truth Snippet |
+|----------|------|-------|---------------------|
+| **Q1** | Summary | "What is this insurance claim about? Provide a summary." | Multi-vehicle collision, DUI, $23,370.80 total |
+| **Q2** | Summary | "Provide a timeline of key events from the incident through vehicle return." | Jan 12 incident → Feb 16 return |
+| **Q3** | Needle | "What was the exact collision deductible amount?" | $750 |
+| **Q4** | Needle | "At what exact time did the accident occur?" | 7:42:15 AM |
+| **Q5** | Needle | "Who was the claims adjuster assigned to this case?" | Kevin Park |
+| **Q6** | MCP | "How many days passed between the incident date and when the claim was filed?" | 3 days (MCP calculation) |
+| **Q7** | Sparse | "What specific observation did Patricia O'Brien make about lighting conditions?" | Sunrise 6:58 AM, normal cycle |
+| **Q8** | Hybrid | "Summarize the medical treatment and provide the exact number of physical therapy sessions." | Whiplash, 8 PT sessions |
+| **Q9** | Needle | "What was Robert Harrison's Blood Alcohol Concentration (BAC)?" | 0.14%, above legal limit |
+| **Q10** | Summary | "Who were the witnesses and what did they observe?" | Marcus Thompson, Elena Rodriguez, Patricia O'Brien |
 
 ### Evaluation Results (Example)
 
@@ -611,11 +648,17 @@ python main.py
 
 ### Environment Variables
 
-Create `.env` file:
+Create `.env` file with both API keys:
 
 ```bash
-OPENAI_API_KEY=sk-...your-key-here...
+# Required for RAG system (generation)
+OPENAI_API_KEY=sk-...your-openai-key-here...
+
+# Required for LLM-as-a-Judge evaluation (separate model)
+ANTHROPIC_API_KEY=...your-anthropic-key-here...
 ```
+
+**Note**: Using separate models for generation (OpenAI) and evaluation (Anthropic) ensures unbiased assessment.
 
 ---
 
@@ -664,13 +707,61 @@ print(result["output"])
 
 ### Running Evaluation
 
+There are two ways to test the LLM-as-a-Judge evaluation:
+
+#### Option 1: Command Line (run_evaluation.py)
+
 ```bash
 python run_evaluation.py
 ```
 
+This will:
+1. Initialize the Insurance Claim System
+2. Run all 10 predefined test queries from `src/evaluation/test_queries.py`
+3. Evaluate each response using GPT-4 as a judge
+4. Calculate aggregate scores (Correctness, Relevancy, Recall)
+5. Save detailed results to `./evaluation_results/evaluation_results_YYYYMMDD_HHMMSS.json`
+6. Display a summary with performance grade (A-F)
+
 **Output**:
 - Console: Real-time evaluation progress
 - File: `./evaluation_results/evaluation_results_YYYYMMDD_HHMMSS.json`
+
+#### Option 2: Streamlit UI (RAGAS Evaluation Tab)
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Navigate to the **"RAGAS Evaluation"** tab to:
+1. Click **"Load Questions"** to load the same 10 test queries used by `run_evaluation.py`
+2. Select/deselect individual test cases using the checkbox column
+3. Click **"Run RAGAS Evaluation"** to execute the evaluation
+4. View results with color-coded scores (green/yellow/red)
+5. Export results to CSV
+
+**RAGAS Metrics:**
+- **Faithfulness**: Is the answer grounded in the retrieved context?
+- **Answer Relevancy**: Is the answer relevant to the question?
+- **Context Precision**: Are the retrieved chunks relevant?
+- **Context Recall**: Does the context contain the information needed?
+
+#### Test Query Categories
+
+The 10 test queries cover different system capabilities:
+
+| # | Category | Query | Tests |
+|---|----------|-------|-------|
+| 1 | Summary | "What is this insurance claim about?" | Summary Index, MapReduce |
+| 2 | Summary | "Provide a timeline of key events..." | Timeline extraction |
+| 3 | Needle | "What was the exact collision deductible?" | Small chunks, precision |
+| 4 | Needle | "At what exact time did the accident occur?" | Specific fact finding |
+| 5 | Needle | "Who was the claims adjuster?" | Entity extraction |
+| 6 | MCP | "How many days between incident and filing?" | MCP tool calculation |
+| 7 | Sparse | "What did Patricia O'Brien observe about lighting?" | Deep search, rare facts |
+| 8 | Hybrid | "Summarize medical treatment + exact PT sessions" | Multi-index retrieval |
+| 9 | Needle | "What was Robert Harrison's BAC?" | Precise fact extraction |
+| 10 | Summary | "Who were the witnesses and what did they observe?" | Summary retrieval |
 
 ---
 
