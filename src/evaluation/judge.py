@@ -1,0 +1,303 @@
+"""
+LLM-as-a-Judge Evaluation System
+Uses a separate model to evaluate system performance
+"""
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from typing import Dict, Any, List
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class LLMJudge:
+    """
+    LLM-as-a-Judge evaluation system
+    Evaluates: Answer Correctness, Context Relevancy, Context Recall
+    """
+
+    def __init__(self, judge_model: str = "gpt-4", temperature: float = 0):
+        """
+        Initialize LLM Judge
+
+        Args:
+            judge_model: Model to use for evaluation
+            temperature: Temperature setting (0 for deterministic)
+        """
+        self.llm = ChatOpenAI(model=judge_model, temperature=temperature)
+        logger.info(f"LLMJudge initialized with model: {judge_model}")
+
+    def evaluate_correctness(
+        self,
+        query: str,
+        answer: str,
+        ground_truth: str
+    ) -> Dict[str, Any]:
+        """
+        Evaluate answer correctness against ground truth
+
+        Args:
+            query: Original question
+            answer: System's answer
+            ground_truth: Expected correct answer
+
+        Returns:
+            Dictionary with score and reasoning
+        """
+        logger.info("Evaluating answer correctness...")
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an evaluation judge. Rate how accurately the answer matches the ground truth.
+
+Scoring (1-5):
+5 = Perfect match, all key facts correct
+4 = Mostly correct, minor missing details
+3 = Partially correct, some key facts present
+2 = Minimally correct, few facts match
+1 = Incorrect, facts don't match
+
+Consider:
+- Factual accuracy (dates, numbers, names)
+- Completeness of information
+- Absence of contradictions
+
+Respond in JSON format:
+{{"score": <1-5>, "reasoning": "<explanation>", "key_facts_matched": ["fact1", "fact2"], "key_facts_missed": ["fact3"]}}"""),
+            ("human", """Query: {query}
+
+Ground Truth: {ground_truth}
+
+System Answer: {answer}
+
+Evaluate the correctness:""")
+        ])
+
+        chain = prompt | self.llm
+        response = chain.invoke({
+            "query": query,
+            "ground_truth": ground_truth,
+            "answer": answer
+        })
+
+        try:
+            result = json.loads(response.content)
+            return {
+                "metric": "correctness",
+                "score": result.get("score", 0),
+                "reasoning": result.get("reasoning", ""),
+                "matched_facts": result.get("key_facts_matched", []),
+                "missed_facts": result.get("key_facts_missed", [])
+            }
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON, extracting score manually")
+            return self._parse_fallback(response.content, "correctness")
+
+    def evaluate_relevancy(
+        self,
+        query: str,
+        retrieved_context: str
+    ) -> Dict[str, Any]:
+        """
+        Evaluate context relevancy - did the system retrieve relevant information?
+
+        Args:
+            query: Original question
+            retrieved_context: Context retrieved by the system
+
+        Returns:
+            Dictionary with score and reasoning
+        """
+        logger.info("Evaluating context relevancy...")
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an evaluation judge. Rate how relevant the retrieved context is to the query.
+
+Scoring (1-5):
+5 = Highly relevant, directly addresses query
+4 = Mostly relevant, contains answer with some extra info
+3 = Partially relevant, some useful information
+2 = Minimally relevant, mostly unrelated
+1 = Irrelevant, doesn't help answer query
+
+Consider:
+- Does context contain information to answer the query?
+- Is the context specific or too broad?
+- Is there unnecessary information?
+
+Respond in JSON format:
+{{"score": <1-5>, "reasoning": "<explanation>", "relevant_portions": ["portion1", "portion2"], "irrelevant_portions": ["portion3"]}}"""),
+            ("human", """Query: {query}
+
+Retrieved Context:
+{context}
+
+Evaluate the relevancy:""")
+        ])
+
+        chain = prompt | self.llm
+        response = chain.invoke({
+            "query": query,
+            "context": retrieved_context
+        })
+
+        try:
+            result = json.loads(response.content)
+            return {
+                "metric": "relevancy",
+                "score": result.get("score", 0),
+                "reasoning": result.get("reasoning", ""),
+                "relevant_portions": result.get("relevant_portions", []),
+                "irrelevant_portions": result.get("irrelevant_portions", [])
+            }
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON, extracting score manually")
+            return self._parse_fallback(response.content, "relevancy")
+
+    def evaluate_recall(
+        self,
+        query: str,
+        expected_chunks: List[str],
+        retrieved_chunks: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Evaluate context recall - did the system retrieve all necessary chunks?
+
+        Args:
+            query: Original question
+            expected_chunks: Descriptions of chunks that should be retrieved
+            retrieved_chunks: Chunks actually retrieved
+
+        Returns:
+            Dictionary with score and reasoning
+        """
+        logger.info("Evaluating context recall...")
+
+        # Calculate basic recall
+        if not expected_chunks:
+            recall_percentage = 100.0
+        else:
+            matches = 0
+            for expected in expected_chunks:
+                for retrieved in retrieved_chunks:
+                    if expected.lower() in retrieved.lower() or retrieved.lower() in expected.lower():
+                        matches += 1
+                        break
+            recall_percentage = (matches / len(expected_chunks)) * 100
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an evaluation judge. Rate how well the system retrieved all necessary information.
+
+Scoring (1-5):
+5 = All necessary chunks retrieved
+4 = Most necessary chunks retrieved
+3 = Some necessary chunks retrieved
+2 = Few necessary chunks retrieved
+1 = Missed most/all necessary chunks
+
+Consider:
+- Were all relevant document sections accessed?
+- Is any critical information missing?
+
+Respond in JSON format:
+{{"score": <1-5>, "reasoning": "<explanation>", "recall_percentage": <0-100>, "retrieved_expected": ["item1"], "missed_expected": ["item2"]}}"""),
+            ("human", """Query: {query}
+
+Expected Chunks (what should be retrieved):
+{expected}
+
+Actually Retrieved Chunks:
+{retrieved}
+
+Evaluate the recall:""")
+        ])
+
+        chain = prompt | self.llm
+        response = chain.invoke({
+            "query": query,
+            "expected": "\n".join([f"- {chunk}" for chunk in expected_chunks]),
+            "retrieved": "\n".join([f"- {chunk[:200]}..." for chunk in retrieved_chunks])
+        })
+
+        try:
+            result = json.loads(response.content)
+            return {
+                "metric": "recall",
+                "score": result.get("score", 0),
+                "reasoning": result.get("reasoning", ""),
+                "recall_percentage": recall_percentage,
+                "retrieved_expected": result.get("retrieved_expected", []),
+                "missed_expected": result.get("missed_expected", [])
+            }
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON, using calculated recall")
+            return {
+                "metric": "recall",
+                "score": int(recall_percentage / 20) + 1,  # Convert to 1-5 scale
+                "reasoning": f"Calculated recall: {recall_percentage:.1f}%",
+                "recall_percentage": recall_percentage,
+                "retrieved_expected": [],
+                "missed_expected": []
+            }
+
+    def evaluate_full(
+        self,
+        query: str,
+        answer: str,
+        ground_truth: str,
+        retrieved_context: str,
+        expected_chunks: List[str] = None,
+        retrieved_chunks: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Perform full evaluation with all metrics
+
+        Args:
+            query: Original question
+            answer: System's answer
+            ground_truth: Expected answer
+            retrieved_context: Context retrieved by system
+            expected_chunks: Expected chunks to retrieve (optional)
+            retrieved_chunks: Actually retrieved chunks (optional)
+
+        Returns:
+            Complete evaluation results
+        """
+        logger.info(f"Performing full evaluation for query: '{query[:50]}...'")
+
+        results = {
+            "query": query,
+            "correctness": self.evaluate_correctness(query, answer, ground_truth),
+            "relevancy": self.evaluate_relevancy(query, retrieved_context)
+        }
+
+        if expected_chunks and retrieved_chunks:
+            results["recall"] = self.evaluate_recall(query, expected_chunks, retrieved_chunks)
+        else:
+            results["recall"] = {"metric": "recall", "score": "N/A", "reasoning": "Insufficient data for recall evaluation"}
+
+        # Calculate average score
+        scores = [v["score"] for v in results.values() if v.get("score") != "N/A"]
+        results["average_score"] = sum(scores) / len(scores) if scores else 0
+
+        return results
+
+    def _parse_fallback(self, response_text: str, metric_name: str) -> Dict[str, Any]:
+        """Fallback parser when JSON parsing fails"""
+        import re
+
+        score_match = re.search(r'["\']?score["\']?:\s*(\d)', response_text)
+        score = int(score_match.group(1)) if score_match else 0
+
+        return {
+            "metric": metric_name,
+            "score": score,
+            "reasoning": response_text[:200],
+            "parse_method": "fallback"
+        }
+
+
+if __name__ == "__main__":
+    print("LLMJudge module - use via evaluation script")

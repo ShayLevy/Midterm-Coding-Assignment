@@ -1,0 +1,45 @@
+# Core LLM Providers
+openai>=1.0.0
+anthropic>=0.8.0
+
+# LlamaIndex - Indexing & Retrieval
+llama-index>=0.9.48
+llama-index-core>=0.9.48
+llama-index-embeddings-openai>=0.1.6
+llama-index-llms-openai>=0.1.13
+llama-index-vector-stores-chroma>=0.1.6
+
+# LangChain - Agent Orchestration (Latest stable versions)
+# Note: "LangChain 1.0" refers to the 0.3+ stable API series
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# ChromaDB - Vector Store
+chromadb>=0.4.22
+
+# Document Processing
+pypdf>=3.17.0
+python-docx>=1.1.0
+reportlab>=4.0.0
+
+# MCP (Model Context Protocol)
+# Note: MCP is still evolving, install from source if needed
+# For now, we'll implement MCP-style tools using LangChain Tool interface
+
+# Data Validation & Utilities
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Evaluation & Metrics
+pandas>=2.0.0
+numpy>=1.24.0
+ragas>=0.1.0
+datasets>=2.14.0
+
+# Optional: Visualization
+matplotlib>=3.7.0
+
+# Streamlit UI
+streamlit>=1.28.0

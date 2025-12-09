@@ -1,0 +1,231 @@
+"""
+Test Suite with Diverse Queries
+Covers different query types and system capabilities
+"""
+
+from typing import List, Dict, Any
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class TestSuite:
+    """
+    Comprehensive test suite for evaluating the insurance claim system
+    """
+
+    @staticmethod
+    def get_test_queries() -> List[Dict[str, Any]]:
+        """
+        Get all test queries with ground truth and expected behavior
+
+        Returns:
+            List of test query dictionaries
+        """
+        return [
+            # Query 1: High-level summary (tests Summary Index)
+            {
+                "id": "Q1_SUMMARY",
+                "query": "What is this insurance claim about? Provide a summary.",
+                "type": "summary",
+                "expected_agent": "summarization",
+                "expected_index": "summary",
+                "ground_truth": "This is an auto insurance claim (CLM-2024-001) for a multi-vehicle collision that occurred on January 12, 2024, at 7:42 AM at the intersection of Wilshire Blvd and Vermont Ave in Los Angeles. Sarah Mitchell's 2021 Honda Accord was struck by Robert Harrison's vehicle which ran a red light while Harrison was driving under the influence (BAC 0.14). A secondary low-speed collision occurred when Jennifer Park's vehicle struck Mitchell's car from behind. Mitchell sustained neck injuries (whiplash), the vehicle required $17,111.83 in repairs, and the total claim amount was $23,370.80. Harrison was arrested for DUI and accepted 100% liability.",
+                "expected_chunks": [
+                    "Incident description",
+                    "Timeline of events",
+                    "Financial summary",
+                    "Parties involved"
+                ],
+                "key_facts": [
+                    "Multi-vehicle collision",
+                    "DUI involved",
+                    "January 12, 2024",
+                    "Whiplash injury",
+                    "Total claim ~$23,370"
+                ]
+            },
+
+            # Query 2: Timeline query (tests Summary Index)
+            {
+                "id": "Q2_TIMELINE",
+                "query": "Provide a timeline of key events from the incident through vehicle return.",
+                "type": "summary",
+                "expected_agent": "summarization",
+                "expected_index": "summary",
+                "ground_truth": "January 12, 2024 (7:42 AM): Incident occurred. January 15, 2024: Claim filed. January 26, 2024: Liability accepted by at-fault party. January 29, 2024: Repairs authorized and commenced. February 15, 2024: Repairs completed. February 16, 2024: Vehicle returned to policyholder.",
+                "expected_chunks": [
+                    "Incident Timeline section",
+                    "Post-incident timeline"
+                ],
+                "key_facts": [
+                    "January 12 - incident",
+                    "January 15 - filed",
+                    "February 16 - vehicle returned"
+                ]
+            },
+
+            # Query 3: Needle query - specific amount (tests Hierarchical Index, small chunks)
+            {
+                "id": "Q3_NEEDLE_DEDUCTIBLE",
+                "query": "What was the exact collision deductible amount?",
+                "type": "needle",
+                "expected_agent": "needle",
+                "expected_index": "hierarchical",
+                "ground_truth": "The collision deductible was exactly $750.",
+                "expected_chunks": [
+                    "Policy Information section",
+                    "Deductible information subsection"
+                ],
+                "key_facts": [
+                    "$750",
+                    "collision deductible"
+                ]
+            },
+
+            # Query 4: Needle query - precise time (tests small chunks)
+            {
+                "id": "Q4_NEEDLE_TIME",
+                "query": "At what exact time did the accident occur?",
+                "type": "needle",
+                "expected_agent": "needle",
+                "expected_index": "hierarchical",
+                "ground_truth": "The accident occurred at exactly 7:42 AM (more precisely 7:42:15 AM based on the incident timeline).",
+                "expected_chunks": [
+                    "Incident Timeline section",
+                    "Time of incident details"
+                ],
+                "key_facts": [
+                    "7:42 AM",
+                    "7:42:15 AM"
+                ]
+            },
+
+            # Query 5: Entity query - person (tests Hierarchical Index)
+            {
+                "id": "Q5_ENTITY_ADJUSTER",
+                "query": "Who was the claims adjuster assigned to this case?",
+                "type": "needle",
+                "expected_agent": "needle",
+                "expected_index": "hierarchical",
+                "ground_truth": "Kevin Park was the claims adjuster assigned to this case.",
+                "expected_chunks": [
+                    "Policy Information or Timeline section",
+                    "Mentions of adjuster assignments"
+                ],
+                "key_facts": [
+                    "Kevin Park",
+                    "claims adjuster"
+                ]
+            },
+
+            # Query 6: Computation query with MCP tool
+            {
+                "id": "Q6_MCP_CALCULATION",
+                "query": "How many days passed between the incident date and when the claim was filed?",
+                "type": "hybrid_mcp",
+                "expected_agent": "manager",
+                "expected_tool": "CalculateDaysBetween",
+                "ground_truth": "3 days passed between the incident (January 12, 2024) and when the claim was filed (January 15, 2024).",
+                "expected_chunks": [
+                    "Timeline section",
+                    "MCP tool calculation"
+                ],
+                "key_facts": [
+                    "3 days",
+                    "January 12 to January 15"
+                ]
+            },
+
+            # Query 7: Sparse data / Needle-in-haystack (tests deep search)
+            {
+                "id": "Q7_SPARSE_WITNESS_DETAIL",
+                "query": "What specific observation did Patricia O'Brien make about lighting conditions?",
+                "type": "needle_sparse",
+                "expected_agent": "needle",
+                "expected_index": "hierarchical",
+                "ground_truth": "Patricia O'Brien noted that the street lights were on a normal cycle and that sunrise was at 6:58 AM, so at 7:42 AM there would have been daylight. She confirmed the Camry definitely would have had a red light.",
+                "expected_chunks": [
+                    "Witness Statements section",
+                    "Patricia O'Brien's statement (Witness #4)"
+                ],
+                "key_facts": [
+                    "Patricia O'Brien",
+                    "lighting conditions",
+                    "sunrise 6:58 AM",
+                    "normal cycle"
+                ]
+            },
+
+            # Query 8: Hybrid query (summary + precise facts)
+            {
+                "id": "Q8_HYBRID",
+                "query": "Summarize the medical treatment and provide the exact number of physical therapy sessions.",
+                "type": "hybrid",
+                "expected_agent": "manager",
+                "expected_index": "both",
+                "ground_truth": "Sarah Mitchell was treated at Cedars-Sinai Emergency Department for cervical strain (whiplash) and post-traumatic headache. She had a follow-up with orthopedist Dr. Rachel Kim who prescribed physical therapy. She completed exactly 8 physical therapy sessions at Pacific Coast Physical Therapy with Marcus Rodriguez, PT, DPT, from February 2-27, 2024. She was cleared for normal activities after completing therapy.",
+                "expected_chunks": [
+                    "Medical Documentation section",
+                    "Physical therapy records"
+                ],
+                "key_facts": [
+                    "8 physical therapy sessions",
+                    "Cervical strain/whiplash",
+                    "Cedars-Sinai ED",
+                    "Dr. Rachel Kim",
+                    "Marcus Rodriguez, PT"
+                ]
+            }
+        ]
+
+    @staticmethod
+    def get_query_by_id(query_id: str) -> Dict[str, Any]:
+        """Get specific test query by ID"""
+        queries = TestSuite.get_test_queries()
+        for q in queries:
+            if q["id"] == query_id:
+                return q
+        raise ValueError(f"Query ID {query_id} not found")
+
+    @staticmethod
+    def get_queries_by_type(query_type: str) -> List[Dict[str, Any]]:
+        """Get all queries of a specific type"""
+        queries = TestSuite.get_test_queries()
+        return [q for q in queries if q["type"] == query_type]
+
+    @staticmethod
+    def print_summary():
+        """Print summary of test suite"""
+        queries = TestSuite.get_test_queries()
+
+        print("\n" + "=" * 70)
+        print("TEST SUITE SUMMARY")
+        print("=" * 70)
+        print(f"Total Queries: {len(queries)}\n")
+
+        # Count by type
+        types = {}
+        for q in queries:
+            qtype = q["type"]
+            types[qtype] = types.get(qtype, 0) + 1
+
+        print("Queries by Type:")
+        for qtype, count in types.items():
+            print(f"  {qtype}: {count}")
+
+        print("\n" + "-" * 70)
+        print("All Test Queries:")
+        print("-" * 70)
+
+        for i, q in enumerate(queries, 1):
+            print(f"\n{i}. [{q['id']}] {q['type'].upper()}")
+            print(f"   Query: {q['query']}")
+            print(f"   Expected Agent: {q.get('expected_agent', 'N/A')}")
+            print(f"   Expected Index: {q.get('expected_index', 'N/A')}")
+            print(f"   Key Facts: {', '.join(q['key_facts'][:3])}...")
+
+
+if __name__ == "__main__":
+    TestSuite.print_summary()

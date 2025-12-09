@@ -1,0 +1,1352 @@
+"""
+Streamlit Interface for Insurance Claim Timeline Retrieval System
+Workflow: Upload PDF → Preview Chunks → Index to ChromaDB → Query
+"""
+
+import streamlit as st
+import os
+import sys
+import logging
+import shutil
+import time
+from pathlib import Path
+from datetime import datetime
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src.indexing.document_loader import InsuranceClaimLoader
+from src.indexing.chunking import HierarchicalChunker
+
+# Page config
+st.set_page_config(
+    page_title="Insurance Claim RAG System",
+    page_icon="📋",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    /* Reduce top padding from main content */
+    .block-container {
+        padding-top: 1rem !important;
+    }
+    /* Reduce top padding from sidebar */
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 0.5rem !important;
+    }
+    .status-box {
+        padding: 8px 12px;
+        border-radius: 6px;
+        margin: 5px 0;
+    }
+    .status-no-db {
+        background-color: #ffebee;
+        border: 2px solid #f44336;
+    }
+    .status-has-db {
+        background-color: #e8f5e9;
+        border: 2px solid #4caf50;
+    }
+    .chunk-card {
+        border-radius: 8px;
+        padding: 12px;
+        margin: 8px 0;
+    }
+    .step-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 8px;
+        margin: 20px 0 10px 0;
+    }
+    /* Disable clear button and text editing in selectboxes */
+    [data-baseweb="select"] [data-testid="stSelectboxClearIcon"],
+    [data-baseweb="select"] svg[title="Clear"],
+    [data-baseweb="select"] [aria-label="Clear all"],
+    [data-baseweb="select"] .css-1dimb5e-indicatorContainer {
+        display: none !important;
+        pointer-events: none !important;
+    }
+    [data-baseweb="select"] input {
+        caret-color: transparent !important;
+        pointer-events: none !important;
+        user-select: none !important;
+        -webkit-user-select: none !important;
+    }
+    /* Make selectbox input non-editable */
+    div[data-baseweb="select"] input[aria-autocomplete="list"] {
+        pointer-events: none !important;
+        user-select: none !important;
+    }
+    /* Hide the clear button container */
+    [data-baseweb="select"] > div > div:last-child > div:first-child {
+        display: none !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+class StreamlitLogHandler(logging.Handler):
+    """Custom log handler that captures logs for Streamlit display"""
+    def __init__(self):
+        super().__init__()
+        self.logs = []
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.logs.append({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'level': record.levelname,
+            'message': log_entry
+        })
+
+    def get_logs(self):
+        return self.logs
+
+    def clear(self):
+        self.logs = []
+
+
+# Initialize session state
+if 'log_handler' not in st.session_state:
+    st.session_state.log_handler = StreamlitLogHandler()
+    st.session_state.log_handler.setFormatter(logging.Formatter('%(name)s - %(message)s'))
+if 'chunks_preview' not in st.session_state:
+    st.session_state.chunks_preview = None
+if 'documents' not in st.session_state:
+    st.session_state.documents = None
+if 'system' not in st.session_state:
+    st.session_state.system = None
+if 'uploaded_file_name' not in st.session_state:
+    st.session_state.uploaded_file_name = None
+if 'query_history' not in st.session_state:
+    st.session_state.query_history = []
+
+# Chunk size defaults
+DEFAULT_CHUNK_SIZES = {
+    'large': 2048,
+    'medium': 512,
+    'small': 128
+}
+DEFAULT_OVERLAP_RATIO = 0.2
+
+
+def setup_logging():
+    """Setup logging to capture to our handler"""
+    # Only add handler to root logger to avoid duplicate logs from propagation
+    root_logger = logging.getLogger()
+    if st.session_state.log_handler not in root_logger.handlers:
+        root_logger.addHandler(st.session_state.log_handler)
+    root_logger.setLevel(logging.INFO)
+
+    # Set log levels for specific loggers without adding duplicate handlers
+    for logger_name in ['src.indexing', 'src.vector_store', 'src.agents', 'src.retrieval', 'src.mcp', 'httpx', 'main']:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.INFO)
+
+
+def check_chroma_exists():
+    """Check if ChromaDB exists and has data"""
+    import chromadb
+    from chromadb.config import Settings
+
+    chroma_dir = Path("./chroma_db")
+    abs_path = str(chroma_dir.absolute())
+
+    if not chroma_dir.exists():
+        return {
+            "exists": False,
+            "status": "No Vector Database Found",
+            "path": abs_path,
+            "message": "Upload a PDF to create the index",
+            "collections": []
+        }
+
+    try:
+        # Use chromadb directly with same settings as VectorStoreManager
+        client = chromadb.PersistentClient(
+            path=str(chroma_dir),
+            settings=Settings(
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+        )
+
+        # Check collections
+        try:
+            summary_col = client.get_collection("insurance_summaries")
+            summary_count = summary_col.count()
+        except:
+            summary_count = 0
+
+        try:
+            hier_col = client.get_collection("insurance_hierarchical")
+            hierarchical_count = hier_col.count()
+        except:
+            hierarchical_count = 0
+
+        # Get last modified time
+        import os
+        mtime = os.path.getmtime(chroma_dir)
+        last_modified = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+
+        if summary_count == 0 and hierarchical_count == 0:
+            return {
+                "exists": False,
+                "status": "Database Empty",
+                "path": abs_path,
+                "message": "No indexes found. Upload a PDF to create indexes.",
+                "collections": []
+            }
+
+        return {
+            "exists": True,
+            "status": "Connected",
+            "path": abs_path,
+            "last_modified": last_modified,
+            "collections": [
+                {"name": "Summary Index", "count": summary_count},
+                {"name": "Hierarchical Index", "count": hierarchical_count}
+            ]
+        }
+    except Exception as e:
+        return {
+            "exists": False,
+            "status": f"Connection Error",
+            "path": abs_path,
+            "message": str(e),
+            "collections": []
+        }
+
+
+def delete_chroma():
+    """Delete ChromaDB directory completely"""
+    import chromadb
+    import gc
+
+    chroma_dir = Path("./chroma_db")
+
+    # Reset system state first
+    st.session_state.system = None
+
+    # Clear ChromaDB client cache
+    try:
+        chromadb.api.client.SharedSystemClient.clear_system_cache()
+    except:
+        pass
+
+    gc.collect()
+
+    if chroma_dir.exists():
+        try:
+            # Remove directory
+            shutil.rmtree(chroma_dir, ignore_errors=True)
+
+            # Double check it's gone, if not try again
+            if chroma_dir.exists():
+                time.sleep(0.5)
+                shutil.rmtree(chroma_dir, ignore_errors=True)
+
+            return True
+        except Exception as e:
+            st.error(f"Error deleting database: {e}")
+            return False
+    return False
+
+
+def load_pdf(uploaded_file):
+    """Load uploaded PDF and return documents"""
+    # Ensure data directory exists
+    data_dir = Path("./data")
+    data_dir.mkdir(exist_ok=True)
+
+    # Save uploaded file
+    file_path = data_dir / uploaded_file.name
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    # Load with our loader
+    loader = InsuranceClaimLoader(data_dir=str(data_dir))
+    documents = loader.load_document(str(file_path))
+
+    return documents, file_path
+
+
+def preview_chunks(documents, chunk_sizes, overlap_ratio):
+    """Generate chunk preview without indexing"""
+    chunker = HierarchicalChunker(
+        chunk_sizes=chunk_sizes,
+        chunk_overlap_ratio=overlap_ratio
+    )
+    nodes = chunker.chunk_documents(documents)
+
+    chunks_info = []
+    for i, node in enumerate(nodes):
+        # Collect all metadata
+        metadata = dict(node.metadata)
+
+        # Parse page_numbers from string back to list for display
+        page_nums_str = node.metadata.get('page_numbers', '1')
+        pages = [int(p) for p in page_nums_str.split(',') if p] if page_nums_str else [1]
+
+        chunks_info.append({
+            'id': i + 1,
+            'node_id': node.id_,
+            'level': node.metadata.get('chunk_level', 'unknown'),
+            'pages': pages,
+            'start_page': node.metadata.get('start_page', 1),
+            'end_page': node.metadata.get('end_page', 1),
+            'size': node.metadata.get('chunk_size', 0),
+            'char_count': len(node.text),
+            'text': node.text,
+            'preview': node.text[:300] + '...' if len(node.text) > 300 else node.text,
+            'metadata': metadata
+        })
+
+    return chunks_info, nodes
+
+
+def index_documents(documents, chunk_sizes, overlap_ratio):
+    """Index documents into ChromaDB"""
+    from main import InsuranceClaimSystem
+    import gc
+    import chromadb
+
+    st.session_state.log_handler.clear()
+    setup_logging()
+
+    # Ensure clean state - clear all references
+    st.session_state.system = None
+
+    # Reset ChromaDB client cache
+    chromadb.api.client.SharedSystemClient.clear_system_cache()
+
+    gc.collect()
+    time.sleep(0.5)
+
+    # Force delete existing DB
+    chroma_dir = Path("./chroma_db")
+    if chroma_dir.exists():
+        shutil.rmtree(chroma_dir, ignore_errors=True)
+        time.sleep(0.5)  # Wait for filesystem
+        if chroma_dir.exists():
+            shutil.rmtree(chroma_dir)  # Try again without ignore_errors
+
+    # Create system (this will index)
+    system = InsuranceClaimSystem(
+        data_dir="./data",
+        chroma_dir="./chroma_db",
+        rebuild_indexes=True
+    )
+
+    st.session_state.system = system
+    return system
+
+
+def run_query(query: str):
+    """Run a query through the system"""
+    if not st.session_state.system:
+        return {"error": "System not initialized", "success": False}
+
+    st.session_state.log_handler.clear()
+    setup_logging()
+
+    start_time = time.time()
+    result = st.session_state.system.query(query)
+    elapsed = time.time() - start_time
+
+    result['elapsed_time'] = f"{elapsed:.2f}s"
+    result['logs'] = st.session_state.log_handler.get_logs()
+
+    st.session_state.query_history.append({
+        'query': query,
+        'result': result,
+        'timestamp': datetime.now().strftime('%H:%M:%S')
+    })
+
+    return result
+
+
+# =============================================================================
+# MAIN UI
+# =============================================================================
+
+st.title("Insurance Claim RAG System")
+
+# Check database status
+db_status = check_chroma_exists()
+
+# =============================================================================
+# SIDEBAR - Status & Controls
+# =============================================================================
+with st.sidebar:
+    # Header with status icon and tooltip showing path
+    status_icon = "🟢" if db_status['exists'] else "🔴"
+    tooltip_text = db_status.get('path', 'No database') if db_status['exists'] else 'No database found'
+    st.markdown(f'<h2 style="margin-bottom: 0.5rem; cursor: help;" title="{tooltip_text}">ChromaDB Status {status_icon}</h2>', unsafe_allow_html=True)
+
+    if db_status['exists']:
+        if 'last_modified' in db_status:
+            st.caption(f"🕐 Last updated: {db_status['last_modified']}")
+
+        st.divider()
+        st.markdown("""
+        <p style="font-weight: 600; font-size: 16px; margin-bottom: 5px;">Workflow</p>
+        <div style="line-height: 1.4; font-size: 14px;">
+        <span style="color: #888; text-decoration: line-through;">1. 📄 Upload PDF</span> ✓<br>
+        <span style="color: #888; text-decoration: line-through;">2. ⚙️ Configure Chunks</span> ✓<br>
+        <span style="color: #888; text-decoration: line-through;">3. 💾 Index to Database</span> ✓<br>
+        <strong>4. 🔍 Query the System</strong> ←
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.divider()
+        st.subheader("Indexes")
+        for col in db_status['collections']:
+            st.markdown(f"**{col['name']}**: {col['count']} items")
+
+        st.divider()
+        if st.button("📄 Upload New Document", type="secondary", use_container_width=True):
+            delete_chroma()
+            st.session_state.chunks_preview = None
+            st.session_state.documents = None
+            st.session_state.uploaded_file_name = None
+            st.rerun()
+
+        if st.button("🗑️ Delete Database", type="secondary", use_container_width=True):
+            delete_chroma()
+            st.session_state.chunks_preview = None
+            st.session_state.documents = None
+            st.session_state.system = None
+            st.rerun()
+    else:
+        st.info("📄 Upload a PDF document to create the vector index.")
+
+        st.divider()
+        st.markdown("""
+        <p style="font-weight: 600; font-size: 16px; margin-bottom: 5px;">Workflow</p>
+        <div style="line-height: 1.4; font-size: 14px;">
+        1. 📄 Upload PDF<br>
+        2. ⚙️ Configure & Preview Chunks<br>
+        3. 💾 Index to Database<br>
+        4. 🔍 Query the System
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# MAIN CONTENT - Workflow Steps
+# =============================================================================
+
+if not db_status['exists']:
+    # ==========================================================================
+    # STEP 1: Upload PDF
+    # ==========================================================================
+    st.markdown('<div class="step-header"><h3 style="margin:0;">Step 1: Upload PDF Document</h3></div>', unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type=['pdf'],
+        help="Upload an insurance claim document to process"
+    )
+
+    if uploaded_file:
+        st.success(f"Uploaded: {uploaded_file.name}")
+
+        # Load the PDF (reload if file changed OR if documents are None due to session reset)
+        if st.session_state.uploaded_file_name != uploaded_file.name or st.session_state.documents is None:
+            with st.spinner("Loading PDF..."):
+                documents, file_path = load_pdf(uploaded_file)
+                st.session_state.documents = documents
+                st.session_state.uploaded_file_name = uploaded_file.name
+                st.session_state.chunks_preview = None  # Reset preview
+            st.success(f"Loaded {len(documents)} document section(s)")
+
+        # ==========================================================================
+        # STEP 2: Configure Chunk Sizes & Preview
+        # ==========================================================================
+        st.markdown('<div class="step-header"><h3 style="margin:0;">Step 2: Configure Chunking & Preview</h3></div>', unsafe_allow_html=True)
+
+        st.caption("Adjust chunk sizes to control how the document is split for retrieval.")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            large_size = st.number_input(
+                "Large Chunk (tokens)",
+                min_value=512,
+                max_value=4096,
+                value=DEFAULT_CHUNK_SIZES['large'],
+                step=256,
+                help="For broad context and summaries"
+            )
+
+        with col2:
+            medium_size = st.number_input(
+                "Medium Chunk (tokens)",
+                min_value=128,
+                max_value=1024,
+                value=DEFAULT_CHUNK_SIZES['medium'],
+                step=64,
+                help="Balanced context and precision"
+            )
+
+        with col3:
+            small_size = st.number_input(
+                "Small Chunk (tokens)",
+                min_value=64,
+                max_value=512,
+                value=DEFAULT_CHUNK_SIZES['small'],
+                step=32,
+                help="High precision for specific facts"
+            )
+
+        with col4:
+            overlap_ratio = st.slider(
+                "Overlap Ratio",
+                min_value=0.1,
+                max_value=0.4,
+                value=DEFAULT_OVERLAP_RATIO,
+                step=0.05,
+                help="Overlap between chunks (% of smallest)"
+            )
+
+        # Validate chunk sizes
+        chunk_sizes = sorted([large_size, medium_size, small_size], reverse=True)
+
+        if chunk_sizes != [large_size, medium_size, small_size]:
+            st.warning("Chunk sizes have been reordered: Large > Medium > Small")
+
+        # Preview button
+        if st.button("Preview Chunks", type="primary"):
+            if st.session_state.documents is None:
+                st.error("Documents not loaded. Please re-upload the PDF.")
+            else:
+                with st.spinner("Generating chunk preview..."):
+                    chunks_info, nodes = preview_chunks(
+                        st.session_state.documents,
+                        chunk_sizes,
+                        overlap_ratio
+                    )
+                    st.session_state.chunks_preview = chunks_info
+                    st.session_state.chunk_sizes = chunk_sizes
+                    st.session_state.overlap_ratio = overlap_ratio
+
+        # Display preview
+        if st.session_state.chunks_preview:
+            chunks = st.session_state.chunks_preview
+
+            st.divider()
+            st.subheader("Chunk Preview")
+
+            # Stats
+            col1, col2, col3, col4, col5 = st.columns(5)
+            large_count = len([c for c in chunks if c['level'] == 'large'])
+            medium_count = len([c for c in chunks if c['level'] == 'medium'])
+            small_count = len([c for c in chunks if c['level'] == 'small'])
+
+            col1.metric("Total Chunks", len(chunks))
+            col2.metric("Large", large_count, help=f"{chunk_sizes[0]} tokens")
+            col3.metric("Medium", medium_count, help=f"{chunk_sizes[1]} tokens")
+            col4.metric("Small", small_count, help=f"{chunk_sizes[2]} tokens")
+
+            all_pages = sorted(set(p for c in chunks for p in c['pages']))
+            col5.metric("Pages Covered", f"{min(all_pages)}-{max(all_pages)}")
+
+            # Filters
+            st.divider()
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                level_filter = st.selectbox("Filter by Level", ["All", "large", "medium", "small"])
+            with col2:
+                page_filter = st.selectbox("Filter by Page", ["All"] + [str(p) for p in all_pages])
+            with col3:
+                search_text = st.text_input("Search text", "")
+
+            # Apply filters
+            filtered = chunks
+            if level_filter != "All":
+                filtered = [c for c in filtered if c['level'] == level_filter]
+            if page_filter != "All":
+                filtered = [c for c in filtered if int(page_filter) in c['pages']]
+            if search_text:
+                filtered = [c for c in filtered if search_text.lower() in c['text'].lower()]
+
+            st.caption(f"Showing {len(filtered)} of {len(chunks)} chunks")
+
+            # Display chunks
+            level_colors = {'large': '#e74c3c', 'medium': '#f39c12', 'small': '#27ae60'}
+
+            for chunk in filtered[:30]:
+                color = level_colors.get(chunk['level'], '#95a5a6')
+                pages_str = ', '.join(map(str, chunk['pages']))
+
+                with st.container():
+                    st.markdown(f"""
+                    <div style="border: 2px solid {color}; border-radius: 8px; padding: 12px; margin: 8px 0; background: #fafafa;">
+                        <div style="display: flex; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; align-items: center;">
+                            <span style="background: {color}; color: white; padding: 2px 12px; border-radius: 12px; font-weight: bold;">
+                                {chunk['level'].upper()}
+                            </span>
+                            <span style="background: #3498db; color: white; padding: 2px 12px; border-radius: 12px;">
+                                Pages: {pages_str}
+                            </span>
+                            <span style="background: #9b59b6; color: white; padding: 2px 12px; border-radius: 12px;">
+                                ~{chunk['size']} tokens
+                            </span>
+                            <span style="color: #666;">({chunk['char_count']} chars)</span>
+                            <span style="color: #999; font-size: 11px;">ID: {chunk['node_id'][:12]}...</span>
+                        </div>
+                        <div style="font-family: monospace; font-size: 12px; color: #333; white-space: pre-wrap; max-height: 120px; overflow-y: auto; background: white; padding: 8px; border-radius: 4px;">
+{chunk['preview']}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Metadata expander
+                    with st.expander(f"📋 View Metadata", expanded=False):
+                        metadata = chunk.get('metadata', {})
+                        # Display metadata in a nice format
+                        col1, col2 = st.columns(2)
+                        meta_items = list(metadata.items())
+                        half = len(meta_items) // 2 + 1
+
+                        with col1:
+                            for key, value in meta_items[:half]:
+                                if isinstance(value, list):
+                                    value = ', '.join(map(str, value))
+                                st.markdown(f"**{key}:** `{value}`")
+
+                        with col2:
+                            for key, value in meta_items[half:]:
+                                if isinstance(value, list):
+                                    value = ', '.join(map(str, value))
+                                st.markdown(f"**{key}:** `{value}`")
+
+            if len(filtered) > 30:
+                st.info(f"Showing first 30 of {len(filtered)} chunks")
+
+            # ==========================================================================
+            # STEP 3: Index to Database
+            # ==========================================================================
+            st.markdown('<div class="step-header"><h3 style="margin:0;">Step 3: Index to Vector Database</h3></div>', unsafe_allow_html=True)
+
+            st.caption("This will create embeddings and store chunks in ChromaDB. This process calls the OpenAI API.")
+
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                if st.button("Index Document", type="primary", use_container_width=True):
+                    progress = st.progress(0, text="Starting indexing...")
+
+                    try:
+                        progress.progress(10, text="Initializing system...")
+                        system = index_documents(
+                            st.session_state.documents,
+                            st.session_state.chunk_sizes,
+                            st.session_state.overlap_ratio
+                        )
+                        progress.progress(100, text="Complete!")
+                        st.success("Document indexed successfully!")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Indexing failed: {str(e)}")
+
+else:
+    # ==========================================================================
+    # DATABASE EXISTS - Show Query Interface with Tabs
+    # ==========================================================================
+
+    # Initialize system if needed
+    if not st.session_state.system:
+        with st.spinner("Loading system..."):
+            from main import InsuranceClaimSystem
+            setup_logging()
+            st.session_state.system = InsuranceClaimSystem(
+                data_dir="./data",
+                chroma_dir="./chroma_db",
+                rebuild_indexes=False
+            )
+
+    # Initialize active tab in session state
+    if 'active_main_tab' not in st.session_state:
+        st.session_state.active_main_tab = "🔍 Query"
+
+    # Create tab selector using radio buttons (maintains state across reruns)
+    tab_options = ["🔍 Query", "📚 Browse Vector DB", "📊 RAGAS Evaluation"]
+    selected_tab = st.radio(
+        "Navigation",
+        tab_options,
+        index=tab_options.index(st.session_state.active_main_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_tab_selector"
+    )
+    st.session_state.active_main_tab = selected_tab
+    st.divider()
+
+    # ==========================================================================
+    # TAB 1: Query Interface
+    # ==========================================================================
+    if selected_tab == "🔍 Query":
+        st.markdown('<div class="step-header"><h3 style="margin:0;">Query the Insurance Claim</h3></div>', unsafe_allow_html=True)
+
+        # Query input with form for Enter key submission
+        with st.form(key="query_form", clear_on_submit=False):
+            query = st.text_input(
+                "Enter your question:",
+                placeholder="e.g., What was the total repair cost? When did the accident occur?"
+            )
+            col1, col2, col3 = st.columns([1, 1, 4])
+            with col1:
+                query_btn = st.form_submit_button("Ask", type="primary", use_container_width=True)
+
+        # Example queries
+        with st.expander("Example Questions", expanded=True):
+            examples = [
+                "What is this insurance claim about?",
+                "What was the exact deductible amount?",
+                "When did the accident occur?",
+                "Summarize the timeline of events",
+                "Who was the claims adjuster?",
+                "What was the total repair cost?",
+                "What did the witnesses say?",
+                "How many days between the incident and claim filing?"
+            ]
+            cols = st.columns(2)
+            for i, ex in enumerate(examples):
+                with cols[i % 2]:
+                    if st.button(ex, key=f"ex_{i}", use_container_width=True):
+                        # Store in session state and rerun
+                        st.session_state.pending_query = ex
+                        st.rerun()
+
+        # Check for pending query from example buttons
+        if 'pending_query' in st.session_state and st.session_state.pending_query:
+            query = st.session_state.pending_query
+            query_btn = True
+            st.session_state.pending_query = None
+
+        # Run query
+        if query_btn and query:
+            with st.spinner("Processing query..."):
+                result = run_query(query)
+
+            # Answer
+            st.subheader("Answer")
+            if result.get('success', False):
+                st.markdown(result.get('output', 'No output'))
+                st.caption(f"Response time: {result.get('elapsed_time', 'N/A')}")
+            else:
+                st.error(result.get('output', 'Error processing query'))
+
+            # Behind the scenes
+            with st.expander("Behind the Scenes (Execution Log)", expanded=True):
+                logs = result.get('logs', [])
+                if logs:
+                    log_text = ""
+                    for log in logs[-30:]:
+                        color = '🟢' if log['level'] == 'INFO' else '🟡' if log['level'] == 'WARNING' else '🔴'
+                        log_text += f"{color} [{log['time']}] {log['message']}\n"
+                    st.code(log_text, language=None)
+                else:
+                    st.info("No logs captured")
+
+        # Query History
+        if st.session_state.query_history:
+            st.divider()
+            st.subheader("Recent Queries")
+
+            for item in reversed(st.session_state.query_history[-5:]):
+                with st.expander(f"[{item['timestamp']}] {item['query'][:60]}..."):
+                    st.markdown(f"**Q:** {item['query']}")
+                    st.markdown(f"**A:** {item['result'].get('output', 'N/A')[:500]}...")
+
+    # ==========================================================================
+    # TAB 2: Browse Vector DB
+    # ==========================================================================
+    elif selected_tab == "📚 Browse Vector DB":
+        st.markdown('<div class="step-header"><h3 style="margin:0;">Browse Vector Database</h3></div>', unsafe_allow_html=True)
+
+        # Get ChromaDB data
+        import chromadb
+        from chromadb.config import Settings
+
+        chroma_dir = Path("./chroma_db")
+
+        try:
+            client = chromadb.PersistentClient(
+                path=str(chroma_dir),
+                settings=Settings(anonymized_telemetry=False, allow_reset=True)
+            )
+
+            # Collection selector
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                collection_name = st.selectbox(
+                    "Select Collection:",
+                    ["insurance_hierarchical", "insurance_summaries"]
+                )
+            with col2:
+                st.markdown("<br>", unsafe_allow_html=True)  # Spacer to align with selectbox label
+                refresh_btn = st.button("🔄 Refresh", use_container_width=True)
+
+            try:
+                collection = client.get_collection(collection_name)
+                total_count = collection.count()
+
+                st.info(f"**{collection_name}**: {total_count} items")
+
+                # Filters
+                st.subheader("Filters")
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    level_filter = st.selectbox(
+                        "Chunk Level:",
+                        ["All", "large", "medium", "small"],
+                        key="browse_level"
+                    )
+                with col2:
+                    page_filter = st.text_input("Page Number:", "", key="browse_page")
+                with col3:
+                    search_text = st.text_input("Search Text:", "", key="browse_search")
+
+                # Build where filter
+                where_filter = None
+                if level_filter != "All":
+                    where_filter = {"chunk_level": level_filter}
+
+                # Get items
+                limit = st.slider("Items to display:", 10, 100, 30)
+
+                if where_filter:
+                    results = collection.get(
+                        where=where_filter,
+                        limit=limit,
+                        include=["documents", "metadatas", "embeddings"]
+                    )
+                else:
+                    results = collection.get(
+                        limit=limit,
+                        include=["documents", "metadatas", "embeddings"]
+                    )
+
+                # Filter by page if specified
+                if page_filter:
+                    try:
+                        page_num = int(page_filter)
+                        filtered_indices = []
+                        for i, meta in enumerate(results['metadatas']):
+                            pages_str = meta.get('page_numbers', '1')
+                            pages = [int(p) for p in pages_str.split(',') if p]
+                            if page_num in pages:
+                                filtered_indices.append(i)
+                        results = {
+                            'ids': [results['ids'][i] for i in filtered_indices],
+                            'documents': [results['documents'][i] for i in filtered_indices],
+                            'metadatas': [results['metadatas'][i] for i in filtered_indices],
+                            'embeddings': [results['embeddings'][i] for i in filtered_indices] if results.get('embeddings') is not None else None
+                        }
+                    except ValueError:
+                        pass
+
+                # Filter by search text
+                if search_text:
+                    filtered_indices = []
+                    for i, doc in enumerate(results['documents']):
+                        if doc and search_text.lower() in doc.lower():
+                            filtered_indices.append(i)
+                    results = {
+                        'ids': [results['ids'][i] for i in filtered_indices],
+                        'documents': [results['documents'][i] for i in filtered_indices],
+                        'metadatas': [results['metadatas'][i] for i in filtered_indices],
+                        'embeddings': [results['embeddings'][i] for i in filtered_indices] if results.get('embeddings') else None
+                    }
+
+                st.caption(f"Showing {len(results['ids'])} items")
+
+                # Build dataframe for table display
+                import pandas as pd
+
+                table_data = []
+                embeddings_list = results.get('embeddings') if results.get('embeddings') is not None else [None] * len(results['ids'])
+                for doc_id, doc, meta, emb in zip(results['ids'], results['documents'], results['metadatas'], embeddings_list):
+                    row = {
+                        'ID': doc_id[:15] + '...',
+                        'Level': meta.get('chunk_level', 'N/A'),
+                        'Pages': meta.get('page_numbers', '1'),
+                        'Start Page': meta.get('start_page', 1),
+                        'End Page': meta.get('end_page', 1),
+                        'Tokens': meta.get('chunk_size', 0),
+                        'Vector Dims': len(emb) if emb is not None else 0,
+                        'Claim ID': meta.get('claim_id', 'N/A'),
+                        'Section': meta.get('section_title', 'N/A')[:20],
+                        'Content Preview': (doc[:150] + '...') if doc and len(doc) > 150 else (doc or 'No content'),
+                        'Full Content': doc or 'No content',
+                        'Full ID': doc_id
+                    }
+                    table_data.append(row)
+
+                df = pd.DataFrame(table_data)
+
+                # Display table
+                st.divider()
+
+                # Pagination controls
+                if 'browse_table_page' not in st.session_state:
+                    st.session_state.browse_table_page = 0
+
+                page_size = 10
+                total_items = len(df)
+                total_pages = max(1, (total_items + page_size - 1) // page_size)
+
+                # Reset page if out of bounds
+                if st.session_state.browse_table_page >= total_pages:
+                    st.session_state.browse_table_page = 0
+
+                # Pagination UI
+                col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 1])
+                with col1:
+                    if st.button("⏮️ First", disabled=st.session_state.browse_table_page == 0, use_container_width=True):
+                        st.session_state.browse_table_page = 0
+                        st.rerun()
+                with col2:
+                    if st.button("◀️ Prev", disabled=st.session_state.browse_table_page == 0, use_container_width=True):
+                        st.session_state.browse_table_page -= 1
+                        st.rerun()
+                with col3:
+                    st.markdown(f"<div style='text-align: center; padding: 8px;'>Page {st.session_state.browse_table_page + 1} of {total_pages} ({total_items} items)</div>", unsafe_allow_html=True)
+                with col4:
+                    if st.button("Next ▶️", disabled=st.session_state.browse_table_page >= total_pages - 1, use_container_width=True):
+                        st.session_state.browse_table_page += 1
+                        st.rerun()
+                with col5:
+                    if st.button("Last ⏭️", disabled=st.session_state.browse_table_page >= total_pages - 1, use_container_width=True):
+                        st.session_state.browse_table_page = total_pages - 1
+                        st.rerun()
+
+                # Slice dataframe for current page
+                start_idx = st.session_state.browse_table_page * page_size
+                end_idx = min(start_idx + page_size, total_items)
+                df_page = df.iloc[start_idx:end_idx]
+
+                # Column configuration for better display with row selection
+                selection = st.dataframe(
+                    df_page[['Level', 'Pages', 'Start Page', 'End Page', 'Tokens', 'Vector Dims', 'Claim ID', 'Content Preview']],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        'Level': st.column_config.TextColumn('Level', width='small'),
+                        'Pages': st.column_config.TextColumn('Pages', width='small'),
+                        'Start Page': st.column_config.NumberColumn('Start', width='small'),
+                        'End Page': st.column_config.NumberColumn('End', width='small'),
+                        'Tokens': st.column_config.NumberColumn('Tokens', width='small'),
+                        'Vector Dims': st.column_config.NumberColumn('Vector', width='small'),
+                        'Claim ID': st.column_config.TextColumn('Claim', width='medium'),
+                        'Content Preview': st.column_config.TextColumn('Content Preview', width='large'),
+                    },
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key="chunk_table_selection"
+                )
+
+                # Detail view for selected chunk (from current page)
+                st.divider()
+                st.subheader("Chunk Detail View")
+
+                # Get selected row from table click
+                selected_rows = selection.selection.rows if selection.selection else []
+                if selected_rows:
+                    # Map back to full table index
+                    selected_page_idx = selected_rows[0]
+                    selected_idx = start_idx + selected_page_idx
+                    selected = table_data[selected_idx]
+                    meta = results['metadatas'][selected_idx]
+                    embedding = results['embeddings'][selected_idx] if results.get('embeddings') is not None else None
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Metadata:**")
+                        for key, value in meta.items():
+                            # Skip _node_content as it's redundant with Full Content
+                            if key == '_node_content':
+                                continue
+                            st.markdown(f"- **{key}:** `{value}`")
+
+                    with col2:
+                        st.markdown("**Full Content:**")
+                        st.text_area("Content", value=selected['Full Content'], height=300, disabled=True)
+
+                    # Display embedding vector
+                    st.divider()
+                    st.markdown("**Embedding Vector:**")
+                    if embedding is not None:
+                        import numpy as np
+                        embedding_array = np.array(embedding)
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Dimensions", len(embedding))
+                        with col2:
+                            st.metric("Min Value", f"{embedding_array.min():.6f}")
+                        with col3:
+                            st.metric("Max Value", f"{embedding_array.max():.6f}")
+
+                        # Show first/last values preview
+                        with st.expander("View Embedding Values", expanded=True):
+                            st.caption(f"First 20 values: {embedding[:20]}")
+                            st.caption(f"Last 20 values: {embedding[-20:]}")
+                            # Format embedding as comma-separated values with line breaks
+                            formatted_embedding = ",\n".join([f"{v:.8f}" for v in embedding])
+                            st.text_area(
+                                "Full Embedding Vector",
+                                value=formatted_embedding,
+                                height=400,
+                                disabled=True
+                            )
+                    else:
+                        st.info("No embedding data available")
+                else:
+                    st.info("Click on a row in the table above to view its details")
+
+            except Exception as e:
+                st.warning(f"Collection '{collection_name}' not found or empty: {e}")
+
+        except Exception as e:
+            st.error(f"Error connecting to ChromaDB: {e}")
+
+    # ==========================================================================
+    # TAB 3: RAGAS Evaluation
+    # ==========================================================================
+    elif selected_tab == "📊 RAGAS Evaluation":
+        st.markdown('<div class="step-header"><h3 style="margin:0;">RAGAS Evaluation</h3></div>', unsafe_allow_html=True)
+
+        st.info("""
+        **RAGAS (Retrieval Augmented Generation Assessment)** evaluates RAG pipeline quality using metrics:
+        - **Faithfulness**: Is the answer grounded in the retrieved context?
+        - **Answer Relevancy**: Is the answer relevant to the question?
+        - **Context Precision**: Are the retrieved chunks relevant?
+        - **Context Recall**: Does the context contain the information needed?
+        """)
+
+        # Initialize RAGAS session state
+        if 'ragas_test_cases' not in st.session_state:
+            st.session_state.ragas_test_cases = []
+        if 'ragas_results' not in st.session_state:
+            st.session_state.ragas_results = None
+
+        # Test case management
+        st.subheader("Test Cases")
+
+        # Add test case form
+        with st.expander("Add Test Case", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                test_question = st.text_input("Question:", key="ragas_question",
+                    placeholder="e.g., When did the accident occur?")
+            with col2:
+                ground_truth = st.text_input("Ground Truth (optional):", key="ragas_ground_truth",
+                    placeholder="e.g., January 15, 2024")
+
+            if st.button("Add Test Case", type="primary"):
+                if test_question:
+                    st.session_state.ragas_test_cases.append({
+                        'question': test_question,
+                        'ground_truth': ground_truth if ground_truth else None
+                    })
+                    st.success(f"Added test case: {test_question[:50]}...")
+                    st.rerun()
+                else:
+                    st.warning("Please enter a question")
+
+        # Predefined test cases
+        needle_cases = [
+            {"question": "What was Robert Harrison's Blood Alcohol Concentration (BAC)?", "ground_truth": "0.14%", "category": "Needle"},
+            {"question": "What was the collision deductible amount?", "ground_truth": "$750", "category": "Needle"},
+            {"question": "What was the exact time the incident occurred?", "ground_truth": "7:42:15 AM on January 12, 2024", "category": "Needle"},
+            {"question": "What was the final total repair cost for the vehicle?", "ground_truth": "$17,111.83", "category": "Needle"},
+            {"question": "What was the policyholder's vehicle mileage at the time of the incident?", "ground_truth": "23,847 miles", "category": "Needle"},
+        ]
+
+        general_cases = [
+            {"question": "What is this insurance claim about?", "ground_truth": "Multi-vehicle collision claim involving Sarah Mitchell's 2021 Honda Accord being struck by a DUI driver (Robert Harrison) who ran a red light at Wilshire Blvd and Vermont Ave intersection", "category": "General"},
+            {"question": "What injuries did the policyholder sustain and what treatment was provided?", "ground_truth": "Cervical strain (whiplash), post-traumatic headache, and minor contusions. Treatment included emergency department visit, soft cervical collar, pain medication, orthopedic consultation, and 8 physical therapy sessions", "category": "General"},
+            {"question": "Who were the witnesses and what did they observe?", "ground_truth": "Marcus Thompson, Elena Rodriguez, and Patricia O'Brien (RN) - all confirmed Harrison ran a clearly red light while visibly intoxicated, traveling at high speed without braking", "category": "General"},
+            {"question": "What was the outcome of the liability investigation?", "ground_truth": "Nationwide Insurance (carrier for at-fault driver Robert Harrison) accepted 100% liability on January 26, 2024, agreeing to cover all property damage and medical expenses", "category": "General"},
+            {"question": "Summarize the timeline of events on the day of the accident", "ground_truth": "7:38 AM departure, 7:42:15 AM collision occurred, 7:43 AM Harrison exits vehicle showing signs of intoxication, 7:44 AM 911 called, 7:51 AM police arrive, 8:02 AM breathalyzer shows 0.14% BAC, 8:15 AM Mitchell transported to hospital, 10:17 AM discharged with cervical strain diagnosis", "category": "General"},
+        ]
+
+        all_predefined_cases = needle_cases + general_cases
+
+        if st.button("Load Questions", type="primary"):
+            st.session_state.ragas_test_cases = all_predefined_cases.copy()
+
+        # Display current test cases
+        if st.session_state.ragas_test_cases:
+            st.divider()
+            st.subheader(f"Test Cases ({len(st.session_state.ragas_test_cases)})")
+
+            # Create dataframe with checkbox column
+            import pandas as pd
+
+            # Build initial data for display (Select defaults to True)
+            table_data = []
+            for i, tc in enumerate(st.session_state.ragas_test_cases):
+                table_data.append({
+                    'Select': True,
+                    'Category': tc.get('category', 'N/A'),
+                    'Question': tc['question'],
+                    'Ground Truth': tc.get('ground_truth', '')
+                })
+
+            df = pd.DataFrame(table_data)
+
+            # Custom CSS for auto-sizing first columns
+            st.markdown("""
+            <style>
+                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(1),
+                [data-testid="stDataEditor"] td:nth-child(1) { width: auto !important; min-width: 40px !important; max-width: 60px !important; }
+                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(2),
+                [data-testid="stDataEditor"] td:nth-child(2) { width: auto !important; min-width: 60px !important; max-width: 80px !important; }
+                [data-testid="stDataEditor"] [data-testid="column-header"]:nth-child(3),
+                [data-testid="stDataEditor"] td:nth-child(3) { width: auto !important; min-width: 200px !important; }
+            </style>
+            """, unsafe_allow_html=True)
+
+            # Use data_editor for editable checkboxes - it maintains its own state via key
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'Select': st.column_config.CheckboxColumn('', default=True),
+                    'Category': st.column_config.TextColumn('Category'),
+                    'Question': st.column_config.TextColumn('Question'),
+                    'Ground Truth': st.column_config.TextColumn('Ground Truth'),
+                },
+                disabled=['Category', 'Question', 'Ground Truth'],
+                key="ragas_table_editor"
+            )
+
+            # Get selection from edited dataframe (data_editor maintains state)
+            selected_count = edited_df['Select'].sum()
+            st.caption(f"Selected: {int(selected_count)}/{len(st.session_state.ragas_test_cases)}")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Clear All Test Cases", type="secondary"):
+                    st.session_state.ragas_test_cases = []
+                    st.session_state.ragas_results = None
+                    # Clear the data_editor state
+                    if 'ragas_table_editor' in st.session_state:
+                        del st.session_state['ragas_table_editor']
+
+            with col2:
+                run_eval = st.button("Run RAGAS Evaluation", type="primary", use_container_width=True)
+
+            if run_eval and selected_count > 0:
+                with st.spinner("Running RAGAS evaluation... This may take a few minutes."):
+                    try:
+                        # Import RAGAS components
+                        from ragas import evaluate
+                        from ragas.metrics import (
+                            faithfulness,
+                            answer_relevancy,
+                            context_precision,
+                            context_recall
+                        )
+                        from ragas.llms import LangchainLLMWrapper
+                        from ragas.embeddings import LangchainEmbeddingsWrapper
+                        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+                        from datasets import Dataset
+
+                        # Configure RAGAS with OpenAI models
+                        ragas_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini", temperature=0))
+                        ragas_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="text-embedding-3-small"))
+
+                        # Collect data for evaluation
+                        questions = []
+                        answers = []
+                        contexts = []
+                        ground_truths = []
+
+                        progress = st.progress(0, text="Processing test cases...")
+
+                        # Filter to only selected test cases using edited_df
+                        selected_cases = [
+                            (i, tc) for i, tc in enumerate(st.session_state.ragas_test_cases)
+                            if edited_df['Select'].iloc[i]
+                        ]
+                        total_cases = len(selected_cases)
+
+                        if total_cases == 0:
+                            st.warning("No test cases selected. Please select at least one question.")
+                            st.stop()
+
+                        for idx, (orig_idx, test_case) in enumerate(selected_cases):
+                            progress.progress(
+                                (idx + 1) / total_cases,
+                                text=f"Processing Q{orig_idx+1} ({idx+1}/{total_cases}): {test_case['question'][:40]}..."
+                            )
+
+                            # Run query through the system
+                            result = st.session_state.system.query(test_case['question'])
+
+                            questions.append(test_case['question'])
+                            answers.append(result.get('output', ''))
+
+                            # Get contexts from the retrieval
+                            # We need to retrieve contexts separately for RAGAS
+                            retrieved_contexts = []
+                            if hasattr(st.session_state.system, 'hierarchical_retriever'):
+                                nodes = st.session_state.system.hierarchical_retriever.retrieve(
+                                    test_case['question'], k=3, auto_merge=True
+                                )
+                                retrieved_contexts = [node.node.text for node in nodes]
+
+                            contexts.append(retrieved_contexts if retrieved_contexts else [result.get('output', '')])
+                            ground_truths.append(test_case['ground_truth'] if test_case['ground_truth'] else '')
+
+                        progress.progress(1.0, text="Running RAGAS metrics...")
+
+                        # Create dataset for RAGAS
+                        eval_data = {
+                            'question': questions,
+                            'answer': answers,
+                            'contexts': contexts,
+                            'ground_truth': ground_truths
+                        }
+
+                        dataset = Dataset.from_dict(eval_data)
+
+                        # Select metrics based on whether ground truth is available
+                        has_ground_truth = any(gt for gt in ground_truths if gt)
+                        if has_ground_truth:
+                            metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+                        else:
+                            metrics = [faithfulness, answer_relevancy, context_precision]
+
+                        # Run evaluation with configured LLM and embeddings
+                        eval_result = evaluate(
+                            dataset,
+                            metrics=metrics,
+                            llm=ragas_llm,
+                            embeddings=ragas_embeddings
+                        )
+
+                        # Convert EvaluationResult to dict for easier access
+                        metric_keys = ['faithfulness', 'answer_relevancy', 'context_precision', 'context_recall']
+                        scores_dict = {}
+                        for metric_key in metric_keys:
+                            try:
+                                scores_dict[metric_key] = eval_result[metric_key]
+                            except (KeyError, TypeError):
+                                scores_dict[metric_key] = None
+
+                        st.session_state.ragas_results = {
+                            'scores': scores_dict,
+                            'details': eval_data,
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+
+                        st.success("Evaluation complete!")
+                        st.rerun()
+
+                    except ImportError as e:
+                        st.error(f"""
+                        RAGAS not installed. Please install it:
+                        ```
+                        pip install ragas datasets
+                        ```
+                        Error: {e}
+                        """)
+                    except Exception as e:
+                        st.error(f"Evaluation error: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+        # Display results
+        if st.session_state.ragas_results:
+            st.divider()
+            st.subheader("Evaluation Results")
+            st.caption(f"Evaluated at: {st.session_state.ragas_results['timestamp']}")
+
+            results = st.session_state.ragas_results['scores']
+
+            # Display overall scores
+            st.markdown("### Overall Scores")
+            score_cols = st.columns(4)
+
+            metric_names = ['faithfulness', 'answer_relevancy', 'context_precision', 'context_recall']
+            metric_descriptions = [
+                "Answer grounded in context",
+                "Answer relevant to question",
+                "Retrieved chunks relevant",
+                "Context has needed info"
+            ]
+
+            for i, (metric, desc) in enumerate(zip(metric_names, metric_descriptions)):
+                with score_cols[i]:
+                    score = results.get(metric, None)
+                    if score is not None:
+                        # Handle list scores (per-sample) by averaging
+                        if isinstance(score, list):
+                            score = sum(score) / len(score) if score else 0
+                        # Color code based on score
+                        if score >= 0.8:
+                            color = "🟢"
+                        elif score >= 0.5:
+                            color = "🟡"
+                        else:
+                            color = "🔴"
+                        st.metric(
+                            label=f"{color} {metric.replace('_', ' ').title()}",
+                            value=f"{score:.2%}",
+                            help=desc
+                        )
+                    else:
+                        st.metric(label=metric.replace('_', ' ').title(), value="N/A")
+
+            # Show detailed results
+            with st.expander("Detailed Results by Question"):
+                details = st.session_state.ragas_results['details']
+
+                for i, (q, a, ctx) in enumerate(zip(
+                    details['question'],
+                    details['answer'],
+                    details['contexts']
+                )):
+                    st.markdown(f"**Q{i+1}: {q}**")
+                    st.markdown(f"**Answer:** {a[:300]}..." if len(a) > 300 else f"**Answer:** {a}")
+                    st.markdown(f"**Contexts Retrieved:** {len(ctx)}")
+                    st.divider()
+
+            # Export option
+            if st.button("Export Results as CSV"):
+                import pandas as pd
+                export_data = {
+                    'Question': st.session_state.ragas_results['details']['question'],
+                    'Answer': st.session_state.ragas_results['details']['answer'],
+                    'Ground Truth': st.session_state.ragas_results['details']['ground_truth'],
+                }
+                # Add overall scores
+                for metric in metric_names:
+                    score = results.get(metric, None)
+                    export_data[metric] = [score] * len(export_data['Question']) if score else ['N/A'] * len(export_data['Question'])
+
+                df = pd.DataFrame(export_data)
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name=f"ragas_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+
+# Footer
+st.divider()
+st.caption("Insurance Claim RAG System | LlamaIndex + LangGraph + ChromaDB + RAGAS")
